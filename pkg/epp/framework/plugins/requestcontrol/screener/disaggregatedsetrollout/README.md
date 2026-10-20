@@ -330,6 +330,9 @@ request. Do not add it to a scheduling profile.
 | `revisionGating.disableCoordination` | boolean | No | `false` | Disables coordination of rollout revisions across parallel requests. Set only for known sequential P/D deployments; E/P/D requires coordination. |
 | `revisionGating.affinity.mode` | string | No | `none` | `none` draws each request's revision at random. `prefix` keys the draw on the session header, the agent identity, or the conversation prefix; see [Revision Affinity](#revision-affinity). |
 | `revisionGating.affinity.sessionHeader` | string | No | | With `prefix`, a request header whose value keys the draw when present, ahead of the conversation prefix. |
+| `revisionGating.overflow.maxInFlightRequests` | integer | No | | Enables overflow: when every endpoint of `overflow.role` in the drawn revision has this many requests in flight, the request goes to a revision with room; see [Revision Overflow](#revision-overflow). Set it to the concurrency filter's request limit, `maxConcurrency * (1 + headroom)` truncated to an integer. |
+| `revisionGating.overflow.role` | string | No | `prefill` | The role whose endpoints must have room; one of `requiredRoles`. |
+| `revisionGating.overflow.inFlightLoadProducerName` | string | No | | The `inflight-load-producer` whose counts are read; empty selects the default name. |
 
 ## Revision Affinity
 
@@ -373,6 +376,41 @@ mapped onto the same weighted ranges:
 The split is per key, not per request. A key that carries a large fraction of
 the traffic, such as a session header shared by many clients, sends all of that
 traffic to one revision. Leave affinity off when a few keys dominate traffic.
+
+## Revision Overflow
+
+Flow control admits on the average load of the whole pool, so during a rollout
+one revision can be full while the other has room. A fail-closed concurrency
+filter then rejects the request with HTTP 429 although capacity exists.
+
+```yaml
+    revisionGating:
+      mode: max-role
+      requiredRoles: [prefill, decode]
+      overflow:
+        maxInFlightRequests: 12
+```
+
+- After drawing a revision, the Screener reads each endpoint's in-flight
+  requests from the `inflight-load-producer`. When every endpoint of
+  `overflow.role` in the drawn revision is at `maxInFlightRequests`, the request
+  goes to a revision that has an endpoint with room, drawn over those
+  revisions' shares.
+- Nothing is stored. With affinity on, the session's later turns draw their
+  usual revision again, which still holds their KV cache; only the overflowed
+  request pays a cache miss.
+- When no revision has room, the drawn revision is kept. A strict revision
+  header is never overridden.
+- Only the request count of `overflow.role` is checked. A token limit that the
+  incoming request's uncached tokens would exceed is not known before
+  scheduling, and a full endpoint of another role (for example decode) does
+  not trigger overflow.
+- Coordination wins over overflow. When a request is screened again under a
+  decision ID that already holds a revision (the phases of one P/D or E/P/D
+  request, or a proxy retry that keeps `x-request-id`), it gets that revision
+  even if it is full, so every part of the request stays on one revision.
+- `llm_d_router_endpoint_picker_disaggregatedset_revision_overflow_total`
+  counts overflows by source and target revision.
 
 ## DisaggregatedSet Slice Affinity
 

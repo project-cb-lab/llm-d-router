@@ -258,3 +258,29 @@ func assertValidateError(t *testing.T, cfg Config, wantSubstring string) {
 		t.Fatalf("error %q does not contain %q", err.Error(), wantSubstring)
 	}
 }
+
+func TestValidate_Overflow(t *testing.T) {
+	cfg := validConfig()
+	cfg.RevisionGating.Overflow = &RevisionOverflow{MaxInFlightRequests: 12}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("overflow rejected: %v", err)
+	}
+	if cfg.RevisionGating.Overflow.Role != DefaultOverflowRole {
+		t.Fatalf("overflow role defaults to %q, got %q", DefaultOverflowRole, cfg.RevisionGating.Overflow.Role)
+	}
+	for _, tc := range []struct {
+		mode     GatingMode
+		overflow RevisionOverflow
+		want     string
+	}{
+		{GatingModeSum, RevisionOverflow{}, "maxInFlightRequests must be positive"},
+		{GatingModeSum, RevisionOverflow{MaxInFlightRequests: -1}, "maxInFlightRequests must be positive"},
+		{GatingModeSum, RevisionOverflow{MaxInFlightRequests: 12, Role: "encode"}, "must be one of revisionGating.requiredRoles"},
+		{GatingModeDisabled, RevisionOverflow{MaxInFlightRequests: 12}, "revisionGating.overflow requires revisionGating.mode"},
+	} {
+		cfg := validConfig()
+		cfg.RevisionGating.Mode = tc.mode
+		cfg.RevisionGating.Overflow = &tc.overflow
+		assertValidateError(t, cfg, tc.want)
+	}
+}

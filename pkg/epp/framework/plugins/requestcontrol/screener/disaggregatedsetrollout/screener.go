@@ -82,7 +82,9 @@ func (c *Screener) Screen(ctx context.Context, request *fwksched.InferenceReques
 		if !keyed {
 			draw = rand.Float64() //#nosec G404 -- traffic split across revisions, not security-sensitive
 		}
-		chosenRevision = pickWeightedRevision(shares, draw)
+		drawn := pickWeightedRevision(shares, draw)
+		overflowed := c.overflowRevision(endpoints, shares, drawn, draw)
+		chosenRevision = overflowed
 		if decisionID := revisionDecisionID(request); distribution.needsCoordination && decisionID != "" && chosenRevision != "" {
 			var err error
 			chosenRevision, err = c.getOrSetRevision(ctx, decisionID, chosenRevision)
@@ -90,6 +92,11 @@ func (c *Screener) Screen(ctx context.Context, request *fwksched.InferenceReques
 				log.FromContext(ctx).Error(err, "failed to coordinate rollout revision")
 				return nil
 			}
+		}
+		// Count an overflow only when it is what serves: coordination may
+		// return an earlier decision for the same request.
+		if overflowed != drawn && chosenRevision == overflowed {
+			recordRevisionOverflow(c.typedName.Name, drawn, overflowed)
 		}
 	}
 	result := c.filterRevisions(endpoints, allowedRevisions, chosenRevision)

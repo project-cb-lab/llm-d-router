@@ -22,21 +22,26 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 )
 
 var _ fwkplugin.ConsumerPlugin = (*Screener)(nil)
 
-// Consumes declares the agent identity as an optional input when affinity is
-// on: the agent-identity plugin is not a default producer, and without it
-// sessions are keyed on the session header or the conversation prefix.
+// Consumes declares the inputs of the enabled features. The agent identity is
+// optional: the agent-identity plugin is not a default producer, and without
+// it sessions are keyed on the session header or the conversation prefix. The
+// in-flight load is required for overflow, so a missing or misnamed producer
+// fails at startup instead of reading every endpoint as empty.
 func (c *Screener) Consumes() fwkplugin.DataDependencies {
-	if c.config.RevisionGating.affinityMode() != AffinityModePrefix {
-		return fwkplugin.DataDependencies{}
+	deps := fwkplugin.DataDependencies{}
+	if c.config.RevisionGating.affinityMode() == AffinityModePrefix {
+		deps.Optional = map[fwkplugin.DataKey]any{agentidentity.AgentIdentityKey: ""}
 	}
-	return fwkplugin.DataDependencies{
-		Optional: map[fwkplugin.DataKey]any{agentidentity.AgentIdentityKey: ""},
+	if c.config.RevisionGating != nil && c.config.RevisionGating.Overflow != nil {
+		deps.Required = map[fwkplugin.DataKey]any{c.inFlightLoadKey: attrconcurrency.InFlightLoad{}}
 	}
+	return deps
 }
 
 // affinityDraw returns a deterministic draw in [0, 1) for the request, and

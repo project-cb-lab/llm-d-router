@@ -33,6 +33,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
 	podutil "github.com/llm-d/llm-d-router/pkg/epp/util/pod"
 )
@@ -58,6 +59,7 @@ type Screener struct {
 	revisionDecisionStateKey fwkdl.StateKey
 	handle                   fwkplugin.Handle
 	localRevisionDecisions   *fwkplugin.PluginState
+	inFlightLoadKey          fwkplugin.DataKey
 
 	mu           sync.RWMutex
 	pods         map[types.NamespacedName]podInfo
@@ -127,6 +129,9 @@ func newScreener(name string, config Config, scope labels.Selector, handle fwkpl
 		handle:                   handle,
 		localRevisionDecisions:   fwkplugin.NewPluginState(handle.Context()),
 		pods:                     make(map[types.NamespacedName]podInfo),
+	}
+	if config.RevisionGating != nil && config.RevisionGating.Overflow != nil {
+		screener.inFlightLoadKey = attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(config.RevisionGating.Overflow.InFlightLoadProducerName)
 	}
 	return screener
 }

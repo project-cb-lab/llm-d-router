@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/labels"
@@ -69,7 +70,24 @@ type RevisionGating struct {
 	Mode                GatingMode        `json:"mode"`
 	RequiredRoles       []string          `json:"requiredRoles,omitempty"`
 	Affinity            *RevisionAffinity `json:"affinity,omitempty"`
+	Overflow            *RevisionOverflow `json:"overflow,omitempty"`
 }
+
+// RevisionOverflow sends a request to another revision when every endpoint of
+// Role in the drawn revision has no room; see the README's Revision Overflow.
+type RevisionOverflow struct {
+	// Role is the role whose endpoints must have room. Defaults to prefill.
+	Role string `json:"role,omitempty"`
+	// MaxInFlightRequests is the per-endpoint in-flight request count at which
+	// an endpoint has no room.
+	MaxInFlightRequests int64 `json:"maxInFlightRequests"`
+	// InFlightLoadProducerName names the inflight-load-producer whose counts
+	// are read; empty selects the producer of the default name.
+	InFlightLoadProducerName string `json:"inFlightLoadProducerName,omitempty"`
+}
+
+// DefaultOverflowRole is the role checked for room by default.
+const DefaultOverflowRole = "prefill"
 
 // RevisionAffinity controls how the weighted revision choice is drawn.
 //
@@ -207,6 +225,21 @@ func (c *Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("revisionGating.mode %q must be one of sum|max-role|disabled", c.RevisionGating.Mode)
+	}
+
+	if overflow := c.RevisionGating.Overflow; overflow != nil {
+		if !c.RevisionGating.Active() {
+			return fmt.Errorf("revisionGating.overflow requires revisionGating.mode %s or %s", GatingModeSum, GatingModeMaxRole)
+		}
+		if overflow.MaxInFlightRequests <= 0 {
+			return fmt.Errorf("revisionGating.overflow.maxInFlightRequests must be positive, got %d", overflow.MaxInFlightRequests)
+		}
+		if overflow.Role == "" {
+			overflow.Role = DefaultOverflowRole
+		}
+		if !slices.Contains(c.RevisionGating.RequiredRoles, overflow.Role) {
+			return fmt.Errorf("revisionGating.overflow.role %q must be one of revisionGating.requiredRoles", overflow.Role)
+		}
 	}
 
 	if affinity := c.RevisionGating.Affinity; affinity != nil {
