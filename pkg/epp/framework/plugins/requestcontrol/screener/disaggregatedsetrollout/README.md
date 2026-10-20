@@ -328,7 +328,7 @@ request. Do not add it to a scheduling profile.
 | `revisionGating.revisionLabelKey` | string | No | `disaggregatedset.x-k8s.io/revision` | Label identifying a rollout revision. |
 | `revisionGating.roleLabelKey` | string | No | `disaggregatedset.x-k8s.io/role` | Label identifying a Pod role. |
 | `revisionGating.disableCoordination` | boolean | No | `false` | Disables coordination of rollout revisions across parallel requests. Set only for known sequential P/D deployments; E/P/D requires coordination. |
-| `revisionGating.affinity.mode` | string | No | `none` | `none` draws each request's revision at random. `prefix` keys the draw on the session header or conversation prefix; see [Revision Affinity](#revision-affinity). |
+| `revisionGating.affinity.mode` | string | No | `none` | `none` draws each request's revision at random. `prefix` keys the draw on the session header, the agent identity, or the conversation prefix; see [Revision Affinity](#revision-affinity). |
 | `revisionGating.affinity.sessionHeader` | string | No | | With `prefix`, a request header whose value keys the draw when present, ahead of the conversation prefix. |
 
 ## Revision Affinity
@@ -352,8 +352,12 @@ mapped onto the same weighted ranges:
 ```
 
 - The key is the `sessionHeader` value when it is configured and present.
-  Otherwise it is the conversation up to and including its first user message
-  (plus `cache_salt`), for OpenAI chat completions and Anthropic messages.
+  Otherwise it is the agent session the
+  [`agent-identity`](../../requestheader/agentidentity/README.md) plugin
+  resolved from the agent's own header (Claude Code, OpenCode, Codex), when that
+  plugin is configured. Otherwise it is the conversation up to and including its
+  first user message (plus `cache_salt`), for OpenAI chat completions and
+  Anthropic messages.
   Later turns repeat that prefix, so all turns of a session select the same
   revision, while sessions that share only a system prompt still spread out.
 - Requests with nothing to key on fall back to the random draw: completions,

@@ -22,6 +22,7 @@ import (
 
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 )
 
 const testSessionHeader = "x-session-id"
@@ -122,6 +123,64 @@ func TestAffinityDrawSessionHeaderTakesPrecedence(t *testing.T) {
 	withoutHeader := mustDraw(t, screener, chatRequest(nil, chatMessage("user", "one prompt")))
 	if withoutHeader == a {
 		t.Fatal("a request without the session header must key on its prompt")
+	}
+}
+
+func withAgentIdentity(request *fwksched.InferenceRequest, session string) *fwksched.InferenceRequest {
+	request.PutAttribute(agentidentity.AgentIdentityKey, session)
+	return request
+}
+
+func TestAffinityDrawKeysOnAgentIdentity(t *testing.T) {
+	screener := newTestScreener(prefixAffinityConfig(""))
+	a := mustDraw(t, screener, withAgentIdentity(chatRequest(nil, chatMessage("user", "one prompt")), "session-a"))
+	b := mustDraw(t, screener, withAgentIdentity(chatRequest(nil, chatMessage("user", "another prompt")), "session-a"))
+	if a != b {
+		t.Fatalf("same agent session drew %v and %v", a, b)
+	}
+	// Agents often share a long system prompt and first message template; the
+	// agent identity must still separate their sessions.
+	other := mustDraw(t, screener, withAgentIdentity(chatRequest(nil, chatMessage("user", "one prompt")), "session-b"))
+	if other == a {
+		t.Fatal("different agent sessions with the same prompt must not share a key")
+	}
+	if prompt := mustDraw(t, screener, chatRequest(nil, chatMessage("user", "one prompt"))); prompt == a {
+		t.Fatal("a request without an agent identity must key on its prompt")
+	}
+	// Agent sessions are keyed even on bodies the prefix key cannot read.
+	completion := &fwksched.InferenceRequest{
+		Headers: map[string]string{},
+		Body:    &fwkrh.InferenceRequestBody{Completions: &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: "hi"}}},
+	}
+	if got := mustDraw(t, screener, withAgentIdentity(completion, "session-a")); got != a {
+		t.Fatalf("completions request of session-a drew %v, want %v", got, a)
+	}
+}
+
+func TestAffinityDrawSessionHeaderOutranksAgentIdentity(t *testing.T) {
+	screener := newTestScreener(prefixAffinityConfig(testSessionHeader))
+	headers := map[string]string{testSessionHeader: "session-a"}
+	want := mustDraw(t, screener, chatRequest(headers, chatMessage("user", "prompt")))
+	got := mustDraw(t, screener, withAgentIdentity(chatRequest(headers, chatMessage("user", "prompt")), "agent-x"))
+	if got != want {
+		t.Fatalf("configured session header must win over the agent identity: drew %v, want %v", got, want)
+	}
+}
+
+func TestScreenerConsumesAgentIdentityOnlyWithAffinity(t *testing.T) {
+	if deps := newTestScreener(validConfig()).Consumes(); len(deps.Required)+len(deps.Optional) != 0 {
+		t.Fatalf("affinity off must consume nothing, got %+v", deps)
+	}
+	deps := newTestScreener(prefixAffinityConfig("")).Consumes()
+	if _, ok := deps.Optional[agentidentity.AgentIdentityKey]; !ok || len(deps.Required) != 0 {
+		t.Fatalf("affinity on must consume the agent identity as optional, got %+v", deps)
+	}
+}
+
+func TestAffinityDrawIgnoresAgentIdentityWhenAffinityOff(t *testing.T) {
+	screener := newTestScreener(validConfig())
+	if _, ok := screener.affinityDraw(withAgentIdentity(chatRequest(nil, chatMessage("user", "hi")), "session-a")); ok {
+		t.Fatal("affinity off must not key on the agent identity")
 	}
 }
 

@@ -19,9 +19,25 @@ package disaggregatedsetrollout
 import (
 	"github.com/cespare/xxhash/v2"
 
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 )
+
+var _ fwkplugin.ConsumerPlugin = (*Screener)(nil)
+
+// Consumes declares the agent identity as an optional input when affinity is
+// on: the agent-identity plugin is not a default producer, and without it
+// sessions are keyed on the session header or the conversation prefix.
+func (c *Screener) Consumes() fwkplugin.DataDependencies {
+	if c.config.RevisionGating.affinityMode() != AffinityModePrefix {
+		return fwkplugin.DataDependencies{}
+	}
+	return fwkplugin.DataDependencies{
+		Optional: map[fwkplugin.DataKey]any{agentidentity.AgentIdentityKey: ""},
+	}
+}
 
 // affinityDraw returns a deterministic draw in [0, 1) for the request, and
 // false when affinity is off or the request has nothing to key on.
@@ -40,6 +56,12 @@ func (c *Screener) affinityDraw(request *fwksched.InferenceRequest) (float64, bo
 			_, _ = digest.WriteString(session)
 			return drawFromHash(digest.Sum64()), true
 		}
+	}
+	// The agent-identity plugin, when configured, resolves the agent's own
+	// session header (Claude Code, OpenCode, Codex) into this attribute.
+	if session, ok := fwksched.ReadRequestAttribute[string](request, agentidentity.AgentIdentityKey); ok && session != "" {
+		_, _ = digest.WriteString(session)
+		return drawFromHash(digest.Sum64()), true
 	}
 	if !writeConversationPrefix(digest, request.Body) {
 		return 0, false
