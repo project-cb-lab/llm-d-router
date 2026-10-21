@@ -71,7 +71,7 @@ func newGuardedScreener(t *testing.T, config Config, guardParams string) (*Scree
 
 // loadedEndpoint is an endpoint of revision and role carrying requests in flight.
 func loadedEndpoint(name, revision, role string, requests int64) fwksched.Endpoint {
-	e := endpoint(name, map[string]string{testRevLabel: revision, testRoleLabel: role})
+	e := endpoint(name, map[string]string{testRevLabel: revision, testRoleLabel: role, "disaggregatedset.x-k8s.io/name": "my-set"})
 	e.Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{Requests: requests})
 	return e
 }
@@ -325,6 +325,52 @@ func TestOverflowCountsOnlyWhenItServes(t *testing.T) {
 	}
 	if after := testutil.ToFloat64(revisionOverflowTotal.WithLabelValues(PluginType, "test-screener", "v1", "v2")); after != before {
 		t.Fatalf("an overflow overridden by coordination was counted: %v -> %v", before, after)
+	}
+}
+
+func TestOverflowCountsOncePerDecision(t *testing.T) {
+	screener := seededOverflowScreener(t, overflowConfig())
+	request := sessionOnV1(t, screener)
+	request.Headers["x-llm-d-revision-decision-id"] = "phases-1"
+	before := testutil.ToFloat64(revisionOverflowTotal.WithLabelValues(PluginType, "test-screener", "v1", "v2"))
+	// Both phases of one request see v1 full; only the first decides.
+	for phase := range 2 {
+		if got := screenedRevision(t, screener, request, overflowPool(testOverflowLimit, 0)); got != "v2" {
+			t.Fatalf("phase %d served by %s, want v2", phase, got)
+		}
+	}
+	if after := testutil.ToFloat64(revisionOverflowTotal.WithLabelValues(PluginType, "test-screener", "v1", "v2")); after != before+1 {
+		t.Fatalf("overflow metric = %v, want %v", after, before+1)
+	}
+}
+
+func TestOverflowIgnoresOutOfScopeEndpoints(t *testing.T) {
+	screener := seededOverflowScreener(t, overflowConfig())
+	request := sessionOnV1(t, screener)
+	// v2's in-scope prefill endpoints are full too; only an out-of-scope one,
+	// for example not yet released, has room.
+	pool := overflowPool(testOverflowLimit, testOverflowLimit)
+	unreleased := endpoint("v2-prefill-unreleased", map[string]string{testRevLabel: "v2", testRoleLabel: "prefill"})
+	unreleased.Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{})
+	pool = append(pool, unreleased)
+	if got := screenedRevision(t, screener, request, pool); got != "v1" {
+		t.Fatalf("only an out-of-scope endpoint has room: served by %s, want v1", got)
+	}
+}
+
+func TestOverflowLeavesARevisionWithNoEndpointsOfTheRole(t *testing.T) {
+	screener := seededOverflowScreener(t, overflowConfig())
+	request := sessionOnV1(t, screener)
+	// v1 still holds a share, but its prefill endpoints left the pool.
+	var pool []fwksched.Endpoint
+	for _, e := range overflowPool(0, 0) {
+		if e.GetMetadata().Labels[testRevLabel] == "v1" && e.GetMetadata().Labels[testRoleLabel] == "prefill" {
+			continue
+		}
+		pool = append(pool, e)
+	}
+	if got := screenedRevision(t, screener, request, pool); got != "v2" {
+		t.Fatalf("v1 has no prefill endpoint in the pool: served by %s, want v2", got)
 	}
 }
 

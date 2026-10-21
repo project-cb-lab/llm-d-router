@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"sort"
 
+	"k8s.io/apimachinery/pkg/labels"
+
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
@@ -55,16 +57,26 @@ func (c *Screener) overflowRevision(ctx context.Context, request *fwksched.Infer
 	if c.overflowGuard == nil || chosen == "" {
 		return chosen
 	}
-	byRevision := c.overflowEndpointsByRevision(endpoints)
-	// The common case: the chosen revision has room.
-	if candidates := byRevision[chosen]; len(candidates) == 0 || c.hasRoom(ctx, request, candidates) {
+	// The common case: the chosen revision has room. A revision with no
+	// endpoint of the role in the pool has none, for example while its Pods
+	// are still counted Ready but already gone from the pool.
+	var chosenCandidates []fwksched.Endpoint
+	for _, endpoint := range endpoints {
+		if c.overflowRevisionOf(endpoint) == chosen {
+			chosenCandidates = append(chosenCandidates, endpoint)
+		}
+	}
+	if len(chosenCandidates) > 0 && c.hasRoom(ctx, request, chosenCandidates) {
 		return chosen
+	}
+	byRevision := map[string][]fwksched.Endpoint{}
+	for _, endpoint := range endpoints {
+		if revision := c.overflowRevisionOf(endpoint); revision != "" && revision != chosen {
+			byRevision[revision] = append(byRevision[revision], endpoint)
+		}
 	}
 	withRoom := make(map[string]float64, len(shares))
 	for revision, candidates := range byRevision {
-		if revision == chosen {
-			continue
-		}
 		if share, ok := shares[revision]; ok && c.hasRoom(ctx, request, candidates) {
 			withRoom[revision] = share
 		}
@@ -75,24 +87,21 @@ func (c *Screener) overflowRevision(ctx context.Context, request *fwksched.Infer
 	return chosen
 }
 
-// overflowEndpointsByRevision groups the endpoints of the overflow role by
-// revision.
-func (c *Screener) overflowEndpointsByRevision(endpoints []fwksched.Endpoint) map[string][]fwksched.Endpoint {
-	role := c.config.RevisionGating.Overflow.Role
-	byRevision := map[string][]fwksched.Endpoint{}
-	for _, endpoint := range endpoints {
-		if endpoint == nil {
-			continue
-		}
-		metadata := endpoint.GetMetadata()
-		if metadata == nil || metadata.Labels[c.roleLabelKey] != role {
-			continue
-		}
-		if revision := metadata.Labels[c.revisionLabelKey]; revision != "" {
-			byRevision[revision] = append(byRevision[revision], endpoint)
-		}
+// overflowRevisionOf returns the revision of an in-scope endpoint of the
+// overflow role, or "" for any other endpoint. Out-of-scope endpoints are
+// skipped: they are not counted in the shares and must not count as room.
+func (c *Screener) overflowRevisionOf(endpoint fwksched.Endpoint) string {
+	if endpoint == nil {
+		return ""
 	}
-	return byRevision
+	metadata := endpoint.GetMetadata()
+	if metadata == nil || metadata.Labels[c.roleLabelKey] != c.config.RevisionGating.Overflow.Role {
+		return ""
+	}
+	if c.scope != nil && !c.scope.Matches(labels.Set(metadata.Labels)) {
+		return ""
+	}
+	return metadata.Labels[c.revisionLabelKey]
 }
 
 // hasRoom reports whether the guard admits any of the endpoints. The guard

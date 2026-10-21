@@ -398,10 +398,13 @@ filter then rejects the request with HTTP 429 although capacity exists.
             guardPluginName: prefill-concurrency-guard
 ```
 
+- Use the same guard plugin as the prefill profile's filter, so the Screener
+  and the profile decide room alike.
 - After drawing a revision, the Screener runs the guard on the endpoints of
   `overflow.role` in the drawn revision. When it admits none, the request goes
   to a revision where it admits one, drawn over those revisions' shares. The
-  limits stay in the guard's config, so the two cannot drift apart.
+  limits stay in the guard's config, so the two cannot drift apart. Only
+  endpoints in `scope` count as room.
 - The guard must fail closed: a filter that returns every endpoint when all
   are full never shows a full revision. A `concurrency-detector` with
   `failOpen` unset or `true` is rejected at startup.
@@ -414,12 +417,16 @@ filter then rejects the request with HTTP 429 although capacity exists.
   endpoint's in-flight tokens but not the uncached tokens of this request. A
   full endpoint of another role (for example decode) does not trigger
   overflow.
+- The Screener runs before the P/D decider, so it checks prefill room even for
+  a request the decider will later serve decode-only; with an always-disaggregate
+  decider every request uses prefill. It also sees the endpoints before other
+  Screeners narrow them.
 - Coordination wins over overflow. When a request is screened again under a
   decision ID that already holds a revision (the phases of one P/D or E/P/D
   request, or a proxy retry that keeps `x-request-id`), it gets that revision
   even if it is full, so every part of the request stays on one revision.
 - `llm_d_router_endpoint_picker_disaggregatedset_revision_overflow_total`
-  counts overflows by source and target revision.
+  counts overflows by source and target revision, once per decision.
 
 ## DisaggregatedSet Slice Affinity
 
