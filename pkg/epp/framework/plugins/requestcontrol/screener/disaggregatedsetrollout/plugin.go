@@ -103,13 +103,14 @@ func Factory(name string, parameters *json.Decoder, handle fwkplugin.Handle) (fw
 	if name == "" {
 		name = PluginType
 	}
-	config := Config{}
 	if parameters == nil {
 		return nil, errors.New("disaggregatedset-rollout-screener requires parameters")
 	}
-	if err := parameters.Decode(&config); err != nil {
-		return nil, fmt.Errorf("decode disaggregatedset-rollout-screener parameters: %w", err)
+	parsed, err := ConfigParser(parameters, handle)
+	if err != nil {
+		return nil, err
 	}
+	config := *parsed.(*Config)
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}

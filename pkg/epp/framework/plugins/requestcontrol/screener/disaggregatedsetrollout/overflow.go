@@ -26,9 +26,7 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
-// resolveOverflowGuard looks up the overflow guard by name. The guard must fail
-// closed: a filter that returns every endpoint when all are full never shows
-// that a revision has no room.
+// resolveOverflowGuard looks up the overflow guard and rejects one that fails open.
 func (c *Screener) resolveOverflowGuard() error {
 	if c.config.RevisionGating == nil || c.config.RevisionGating.Overflow == nil {
 		return nil
@@ -104,9 +102,7 @@ func (c *Screener) overflowRevisionOf(endpoint fwksched.Endpoint) string {
 	return metadata.Labels[c.revisionLabelKey]
 }
 
-// hasRoom reports whether the guard admits any of the endpoints. The guard
-// runs before the data producers, so a token limit sees the in-flight tokens
-// but not the uncached tokens of this request.
+// hasRoom reports whether the guard admits any of the endpoints.
 func (c *Screener) hasRoom(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) bool {
 	return len(c.overflowGuard.Filter(ctx, request, endpoints)) > 0
 }
