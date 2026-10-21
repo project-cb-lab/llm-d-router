@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/labels"
@@ -69,6 +70,7 @@ type RevisionGating struct {
 	Mode                GatingMode        `json:"mode"`
 	RequiredRoles       []string          `json:"requiredRoles,omitempty"`
 	Affinity            *RevisionAffinity `json:"affinity,omitempty"`
+	Overflow            *RevisionOverflow `json:"overflow,omitempty"`
 }
 
 // RevisionAffinity controls how the weighted revision choice is drawn.
@@ -103,6 +105,19 @@ func (g *RevisionGating) affinityMode() AffinityMode {
 	}
 	return g.Affinity.Mode
 }
+
+// RevisionOverflow sends a request to another revision when the guard admits
+// no endpoint of Role in the drawn revision; see the README's Revision Overflow.
+type RevisionOverflow struct {
+	// Role is the role whose endpoints must have room. Defaults to prefill.
+	Role string `json:"role,omitempty"`
+	// GuardPluginName names the fail-closed scheduling filter that decides
+	// room, typically the concurrency-detector of Role's profile.
+	GuardPluginName string `json:"guardPluginName" pluginRef:""`
+}
+
+// DefaultOverflowRole is the role checked for room by default.
+const DefaultOverflowRole = "prefill"
 
 // UnmarshalJSON normalizes RevisionHeaderName and Affinity.SessionHeader to
 // lowercase because request headers are lowercase in the scheduling request.
@@ -218,6 +233,21 @@ func (c *Config) Validate() error {
 		case AffinityModePrefix:
 		default:
 			return fmt.Errorf("revisionGating.affinity.mode %q must be one of none|prefix", affinity.Mode)
+		}
+	}
+
+	if overflow := c.RevisionGating.Overflow; overflow != nil {
+		if !c.RevisionGating.Active() {
+			return fmt.Errorf("revisionGating.overflow requires revisionGating.mode %s or %s", GatingModeSum, GatingModeMaxRole)
+		}
+		if overflow.GuardPluginName == "" {
+			return errors.New("revisionGating.overflow.guardPluginName is required")
+		}
+		if overflow.Role == "" {
+			overflow.Role = DefaultOverflowRole
+		}
+		if !slices.Contains(c.RevisionGating.RequiredRoles, overflow.Role) {
+			return fmt.Errorf("revisionGating.overflow.role %q must be one of revisionGating.requiredRoles", overflow.Role)
 		}
 	}
 
