@@ -330,9 +330,8 @@ request. Do not add it to a scheduling profile.
 | `revisionGating.disableCoordination` | boolean | No | `false` | Disables coordination of rollout revisions across parallel requests. Set only for known sequential P/D deployments; E/P/D requires coordination. |
 | `revisionGating.affinity.mode` | string | No | `none` | `none` draws each request's revision at random. `prefix` keys the draw on the session header, the agent identity, or the conversation prefix; see [Revision Affinity](#revision-affinity). |
 | `revisionGating.affinity.sessionHeader` | string | No | | With `prefix`, a request header whose value keys the draw when present, ahead of the conversation prefix. |
-| `revisionGating.overflow.maxInFlightRequests` | integer | No | | Enables overflow: when every endpoint of `overflow.role` in the drawn revision has this many requests in flight, the request goes to a revision with room; see [Revision Overflow](#revision-overflow). Set it to the concurrency filter's request limit, `maxConcurrency * (1 + headroom)` truncated to an integer. |
+| `revisionGating.overflow.guardPluginName` | string | No | | Enables overflow: when this filter admits no endpoint of `overflow.role` in the drawn revision, the request goes to a revision where it admits one; see [Revision Overflow](#revision-overflow). A fail-closed scheduling filter. |
 | `revisionGating.overflow.role` | string | No | `prefill` | The role whose endpoints must have room; one of `requiredRoles`. |
-| `revisionGating.overflow.inFlightLoadProducerName` | string | No | | The `inflight-load-producer` whose counts are read; empty selects the default name. |
 
 ## Revision Affinity
 
@@ -384,27 +383,37 @@ one revision can be full while the other has room. A fail-closed concurrency
 filter then rejects the request with HTTP 429 although capacity exists.
 
 ```yaml
-    revisionGating:
-      mode: max-role
-      requiredRoles: [prefill, decode]
-      overflow:
-        maxInFlightRequests: 12
+    - type: concurrency-detector
+      name: prefill-concurrency-guard
+      parameters:
+        maxConcurrency: 8
+        headroom: 0.5
+        failOpen: false
+    - type: disaggregatedset-rollout-screener
+      parameters:
+        revisionGating:
+          mode: max-role
+          requiredRoles: [prefill, decode]
+          overflow:
+            guardPluginName: prefill-concurrency-guard
 ```
 
-- After drawing a revision, the Screener reads each endpoint's in-flight
-  requests from the `inflight-load-producer`. When every endpoint of
-  `overflow.role` in the drawn revision is at `maxInFlightRequests`, the request
-  goes to a revision that has an endpoint with room, drawn over those
-  revisions' shares.
+- After drawing a revision, the Screener runs the guard on the endpoints of
+  `overflow.role` in the drawn revision. When it admits none, the request goes
+  to a revision where it admits one, drawn over those revisions' shares. The
+  limits stay in the guard's config, so the two cannot drift apart.
+- The guard must fail closed: a filter that returns every endpoint when all
+  are full never shows a full revision. A `concurrency-detector` with
+  `failOpen` unset or `true` is rejected at startup.
 - Nothing is stored. With affinity on, the session's later turns draw their
   usual revision again, which still holds their KV cache; only the overflowed
   request pays a cache miss.
 - When no revision has room, the drawn revision is kept. A strict revision
   header is never overridden.
-- Only the request count of `overflow.role` is checked. A token limit that the
-  incoming request's uncached tokens would exceed is not known before
-  scheduling, and a full endpoint of another role (for example decode) does
-  not trigger overflow.
+- The guard runs before the data producers, so a token limit sees the
+  endpoint's in-flight tokens but not the uncached tokens of this request. A
+  full endpoint of another role (for example decode) does not trigger
+  overflow.
 - Coordination wins over overflow. When a request is screened again under a
   decision ID that already holds a revision (the phases of one P/D or E/P/D
   request, or a proxy retry that keeps `x-request-id`), it gets that revision

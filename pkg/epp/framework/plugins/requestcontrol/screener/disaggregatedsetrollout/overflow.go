@@ -17,42 +17,55 @@ limitations under the License.
 package disaggregatedsetrollout
 
 import (
+	"context"
+	"fmt"
 	"sort"
 
-	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 )
 
-// overflowRevision returns chosen, or, when overflow is configured and no
-// endpoint of the overflow role in chosen has room, a revision that has one.
-// When no revision has room, chosen is kept: moving would not help.
-func (c *Screener) overflowRevision(endpoints []fwksched.Endpoint, shares map[string]float64, chosen string, draw float64) string {
-	overflow := c.config.RevisionGating.Overflow
-	if overflow == nil || chosen == "" {
+// resolveOverflowGuard looks up the overflow guard by name. The guard must fail
+// closed: a filter that returns every endpoint when all are full never shows
+// that a revision has no room.
+func (c *Screener) resolveOverflowGuard() error {
+	if c.config.RevisionGating == nil || c.config.RevisionGating.Overflow == nil {
+		return nil
+	}
+	name := c.config.RevisionGating.Overflow.GuardPluginName
+	plugin := c.handle.Plugin(name)
+	if plugin == nil {
+		return fmt.Errorf("revisionGating.overflow.guardPluginName: plugin %q not found", name)
+	}
+	guard, ok := plugin.(fwksched.Filter)
+	if !ok {
+		return fmt.Errorf("revisionGating.overflow.guardPluginName: plugin %q is not a scheduling filter", name)
+	}
+	if failOpen, ok := plugin.(interface{ FailsOpen() bool }); ok && failOpen.FailsOpen() {
+		return fmt.Errorf("revisionGating.overflow.guardPluginName: plugin %q fails open; set failOpen: false", name)
+	}
+	c.overflowGuard = guard
+	return nil
+}
+
+// overflowRevision returns chosen, or, when overflow is configured and the
+// guard admits no endpoint of the overflow role in chosen, a revision where it
+// admits one. When no revision has room, chosen is kept: moving would not help.
+func (c *Screener) overflowRevision(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint,
+	shares map[string]float64, chosen string, draw float64) string {
+	if c.overflowGuard == nil || chosen == "" {
 		return chosen
 	}
+	byRevision := c.overflowEndpointsByRevision(endpoints)
 	// The common case: the chosen revision has room.
-	seenChosen := false
-	for _, endpoint := range endpoints {
-		if c.overflowRevisionOf(endpoint) != chosen {
-			continue
-		}
-		seenChosen = true
-		if c.hasRoom(endpoint) {
-			return chosen
-		}
-	}
-	if !seenChosen {
+	if candidates := byRevision[chosen]; len(candidates) == 0 || c.hasRoom(ctx, request, candidates) {
 		return chosen
 	}
 	withRoom := make(map[string]float64, len(shares))
-	for _, endpoint := range endpoints {
-		revision := c.overflowRevisionOf(endpoint)
-		if revision == "" || revision == chosen {
+	for revision, candidates := range byRevision {
+		if revision == chosen {
 			continue
 		}
-		if share, ok := shares[revision]; ok && c.hasRoom(endpoint) {
+		if share, ok := shares[revision]; ok && c.hasRoom(ctx, request, candidates) {
 			withRoom[revision] = share
 		}
 	}
@@ -62,22 +75,31 @@ func (c *Screener) overflowRevision(endpoints []fwksched.Endpoint, shares map[st
 	return chosen
 }
 
-// overflowRevisionOf returns the revision of an endpoint of the overflow role,
-// or "" for any other endpoint.
-func (c *Screener) overflowRevisionOf(endpoint fwksched.Endpoint) string {
-	if endpoint == nil {
-		return ""
+// overflowEndpointsByRevision groups the endpoints of the overflow role by
+// revision.
+func (c *Screener) overflowEndpointsByRevision(endpoints []fwksched.Endpoint) map[string][]fwksched.Endpoint {
+	role := c.config.RevisionGating.Overflow.Role
+	byRevision := map[string][]fwksched.Endpoint{}
+	for _, endpoint := range endpoints {
+		if endpoint == nil {
+			continue
+		}
+		metadata := endpoint.GetMetadata()
+		if metadata == nil || metadata.Labels[c.roleLabelKey] != role {
+			continue
+		}
+		if revision := metadata.Labels[c.revisionLabelKey]; revision != "" {
+			byRevision[revision] = append(byRevision[revision], endpoint)
+		}
 	}
-	metadata := endpoint.GetMetadata()
-	if metadata == nil || metadata.Labels[c.roleLabelKey] != c.config.RevisionGating.Overflow.Role {
-		return ""
-	}
-	return metadata.Labels[c.revisionLabelKey]
+	return byRevision
 }
 
-func (c *Screener) hasRoom(endpoint fwksched.Endpoint) bool {
-	load, ok := fwkdl.ReadAttribute[*attrconcurrency.InFlightLoad](endpoint, c.inFlightLoadKey)
-	return !ok || load.Requests < c.config.RevisionGating.Overflow.MaxInFlightRequests
+// hasRoom reports whether the guard admits any of the endpoints. The guard
+// runs before the data producers, so a token limit sees the in-flight tokens
+// but not the uncached tokens of this request.
+func (c *Screener) hasRoom(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) bool {
+	return len(c.overflowGuard.Filter(ctx, request, endpoints)) > 0
 }
 
 // drawWithin rescales draw from revision's slice of the pickWeightedRevision

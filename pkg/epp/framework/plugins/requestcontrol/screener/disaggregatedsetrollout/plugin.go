@@ -33,7 +33,6 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
 	podutil "github.com/llm-d/llm-d-router/pkg/epp/util/pod"
 )
@@ -59,7 +58,7 @@ type Screener struct {
 	revisionDecisionStateKey fwkdl.StateKey
 	handle                   fwkplugin.Handle
 	localRevisionDecisions   *fwkplugin.PluginState
-	inFlightLoadKey          fwkplugin.DataKey
+	overflowGuard            fwksched.Filter
 
 	mu           sync.RWMutex
 	pods         map[types.NamespacedName]podInfo
@@ -86,6 +85,19 @@ var (
 	_ fwkdl.NotificationExtractor   = (*podNotificationHandler)(nil)
 )
 
+// ConfigParser decodes the parameters for the config loader, which reads the
+// overflow guard's pluginRef to create the guard before the Screener.
+func ConfigParser(parameters *json.Decoder, _ fwkplugin.Handle) (any, error) {
+	config := &Config{}
+	if parameters == nil {
+		return config, nil
+	}
+	if err := parameters.Decode(config); err != nil {
+		return nil, fmt.Errorf("decode disaggregatedset-rollout-screener parameters: %w", err)
+	}
+	return config, nil
+}
+
 // Factory creates a disaggregatedset-rollout-screener from normal plugin parameters.
 func Factory(name string, parameters *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	if name == "" {
@@ -106,7 +118,11 @@ func Factory(name string, parameters *json.Decoder, handle fwkplugin.Handle) (fw
 		return nil, fmt.Errorf("parse scope.labelSelector: %w", err)
 	}
 	registerMetrics()
-	return newScreener(name, config, scope, handle), nil
+	screener := newScreener(name, config, scope, handle)
+	if err := screener.resolveOverflowGuard(); err != nil {
+		return nil, err
+	}
+	return screener, nil
 }
 
 func newScreener(name string, config Config, scope labels.Selector, handle fwkplugin.Handle) *Screener {
@@ -129,9 +145,6 @@ func newScreener(name string, config Config, scope labels.Selector, handle fwkpl
 		handle:                   handle,
 		localRevisionDecisions:   fwkplugin.NewPluginState(handle.Context()),
 		pods:                     make(map[types.NamespacedName]podInfo),
-	}
-	if config.RevisionGating != nil && config.RevisionGating.Overflow != nil {
-		screener.inFlightLoadKey = attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(config.RevisionGating.Overflow.InFlightLoadProducerName)
 	}
 	return screener
 }

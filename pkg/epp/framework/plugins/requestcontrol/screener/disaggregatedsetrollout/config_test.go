@@ -261,7 +261,7 @@ func assertValidateError(t *testing.T, cfg Config, wantSubstring string) {
 
 func TestValidate_Overflow(t *testing.T) {
 	cfg := validConfig()
-	cfg.RevisionGating.Overflow = &RevisionOverflow{MaxInFlightRequests: 12}
+	cfg.RevisionGating.Overflow = &RevisionOverflow{GuardPluginName: "prefill-guard"}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("overflow rejected: %v", err)
 	}
@@ -273,10 +273,9 @@ func TestValidate_Overflow(t *testing.T) {
 		overflow RevisionOverflow
 		want     string
 	}{
-		{GatingModeSum, RevisionOverflow{}, "maxInFlightRequests must be positive"},
-		{GatingModeSum, RevisionOverflow{MaxInFlightRequests: -1}, "maxInFlightRequests must be positive"},
-		{GatingModeSum, RevisionOverflow{MaxInFlightRequests: 12, Role: "encode"}, "must be one of revisionGating.requiredRoles"},
-		{GatingModeDisabled, RevisionOverflow{MaxInFlightRequests: 12}, "revisionGating.overflow requires revisionGating.mode"},
+		{GatingModeSum, RevisionOverflow{}, "guardPluginName is required"},
+		{GatingModeSum, RevisionOverflow{GuardPluginName: "prefill-guard", Role: "encode"}, "must be one of revisionGating.requiredRoles"},
+		{GatingModeDisabled, RevisionOverflow{GuardPluginName: "prefill-guard"}, "revisionGating.overflow requires revisionGating.mode"},
 	} {
 		cfg := validConfig()
 		cfg.RevisionGating.Mode = tc.mode

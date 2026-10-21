@@ -83,7 +83,7 @@ func (c *Screener) Screen(ctx context.Context, request *fwksched.InferenceReques
 			draw = rand.Float64() //#nosec G404 -- traffic split across revisions, not security-sensitive
 		}
 		drawn := pickWeightedRevision(shares, draw)
-		overflowed := c.overflowRevision(endpoints, shares, drawn, draw)
+		overflowed := c.overflowRevision(ctx, request, endpoints, shares, drawn, draw)
 		chosenRevision = overflowed
 		if decisionID := revisionDecisionID(request); distribution.needsCoordination && decisionID != "" && chosenRevision != "" {
 			var err error

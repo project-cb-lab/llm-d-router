@@ -73,17 +73,14 @@ type RevisionGating struct {
 	Overflow            *RevisionOverflow `json:"overflow,omitempty"`
 }
 
-// RevisionOverflow sends a request to another revision when every endpoint of
-// Role in the drawn revision has no room; see the README's Revision Overflow.
+// RevisionOverflow sends a request to another revision when the guard admits
+// no endpoint of Role in the drawn revision; see the README's Revision Overflow.
 type RevisionOverflow struct {
 	// Role is the role whose endpoints must have room. Defaults to prefill.
 	Role string `json:"role,omitempty"`
-	// MaxInFlightRequests is the per-endpoint in-flight request count at which
-	// an endpoint has no room.
-	MaxInFlightRequests int64 `json:"maxInFlightRequests"`
-	// InFlightLoadProducerName names the inflight-load-producer whose counts
-	// are read; empty selects the producer of the default name.
-	InFlightLoadProducerName string `json:"inFlightLoadProducerName,omitempty"`
+	// GuardPluginName names the fail-closed scheduling filter that decides
+	// room, typically the concurrency-detector of Role's profile.
+	GuardPluginName string `json:"guardPluginName" pluginRef:""`
 }
 
 // DefaultOverflowRole is the role checked for room by default.
@@ -231,8 +228,8 @@ func (c *Config) Validate() error {
 		if !c.RevisionGating.Active() {
 			return fmt.Errorf("revisionGating.overflow requires revisionGating.mode %s or %s", GatingModeSum, GatingModeMaxRole)
 		}
-		if overflow.MaxInFlightRequests <= 0 {
-			return fmt.Errorf("revisionGating.overflow.maxInFlightRequests must be positive, got %d", overflow.MaxInFlightRequests)
+		if overflow.GuardPluginName == "" {
+			return errors.New("revisionGating.overflow.guardPluginName is required")
 		}
 		if overflow.Role == "" {
 			overflow.Role = DefaultOverflowRole

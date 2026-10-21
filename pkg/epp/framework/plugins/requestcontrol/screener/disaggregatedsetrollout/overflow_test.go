@@ -17,24 +17,56 @@ limitations under the License.
 package disaggregatedsetrollout
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/saturationdetector/concurrency"
 )
 
-const testOverflowLimit = 12
+// testOverflowLimit is the request limit of testGuardParams: 8 * (1 + 0.5).
+const (
+	testOverflowLimit = 12
+	testGuardName     = "prefill-guard"
+	testGuardParams   = `{"maxConcurrency": 8, "headroom": 0.5, "failOpen": false}`
+)
 
 func overflowConfig() Config {
 	config := prefixAffinityConfig("")
-	config.RevisionGating.Overflow = &RevisionOverflow{MaxInFlightRequests: testOverflowLimit}
+	config.RevisionGating.Overflow = &RevisionOverflow{GuardPluginName: testGuardName}
 	return config
+}
+
+// newGuardedScreener builds a Screener whose handle holds a concurrency
+// detector named testGuardName, configured by guardParams.
+func newGuardedScreener(t *testing.T, config Config, guardParams string) (*Screener, error) {
+	t.Helper()
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	handle := fwkplugin.NewEppHandle(context.Background(), nil)
+	guard, err := concurrency.ConcurrencyDetectorFactory(testGuardName, json.NewDecoder(strings.NewReader(guardParams)), handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle.AddPlugin(testGuardName, guard)
+	scope, err := labels.Parse(config.Scope.LabelSelector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	screener := newScreener("test-screener", config, scope, handle)
+	return screener, screener.resolveOverflowGuard()
 }
 
 // loadedEndpoint is an endpoint of revision and role carrying requests in flight.
@@ -60,7 +92,10 @@ func overflowPool(v1Prefill, v2Prefill int64) []fwksched.Endpoint {
 
 func seededOverflowScreener(t *testing.T, config Config) *Screener {
 	t.Helper()
-	screener := newTestScreener(config)
+	screener, err := newGuardedScreener(t, config, testGuardParams)
+	if err != nil {
+		t.Fatal(err)
+	}
 	seedCounts(t, screener, map[string]map[string]int{
 		"v1": {"prefill": 2, "decode": 2},
 		"v2": {"prefill": 2, "decode": 2},
@@ -160,23 +195,47 @@ func TestOverflowOffKeepsTheDrawnRevision(t *testing.T) {
 	}
 }
 
-func TestOverflowReadsTheNamedProducer(t *testing.T) {
-	config := overflowConfig()
-	config.RevisionGating.Overflow.InFlightLoadProducerName = "prefill-load"
-	screener := seededOverflowScreener(t, config)
+func TestOverflowUsesTheGuardTokenLimit(t *testing.T) {
+	screener, err := newGuardedScreener(t, overflowConfig(),
+		`{"concurrencyMode": "hybrid", "maxConcurrency": 8, "maxTokenConcurrency": 1000, "headroom": 0, "failOpen": false}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedCounts(t, screener, map[string]map[string]int{
+		"v1": {"prefill": 2, "decode": 2},
+		"v2": {"prefill": 2, "decode": 2},
+	})
 	request := sessionOnV1(t, screener)
-	pool := overflowPool(0, 0)
-	named := attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName("prefill-load")
+	pool := overflowPool(1, 1)
 	for _, e := range pool {
 		if e.GetMetadata().Labels[testRevLabel] == "v1" && e.GetMetadata().Labels[testRoleLabel] == "prefill" {
-			e.Put(named, &attrconcurrency.InFlightLoad{Requests: testOverflowLimit})
+			e.Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{Requests: 1, Tokens: 1000})
 		}
 	}
 	if got := screenedRevision(t, screener, request, pool); got != "v2" {
-		t.Fatalf("named producer shows v1 full: served by %s, want v2", got)
+		t.Fatalf("v1 prefill at its token limit: served by %s, want v2", got)
 	}
-	if _, ok := screener.Consumes().Required[named]; !ok {
-		t.Fatal("overflow must require the named producer's in-flight load")
+}
+
+func TestOverflowGuardMustBeAFailClosedFilter(t *testing.T) {
+	if _, err := newGuardedScreener(t, overflowConfig(), `{"maxConcurrency": 8, "failOpen": true}`); err == nil ||
+		!strings.Contains(err.Error(), "fails open") {
+		t.Fatalf("fail-open guard: err = %v", err)
+	}
+	config := overflowConfig()
+	config.RevisionGating.Overflow.GuardPluginName = "missing"
+	if _, err := newGuardedScreener(t, config, testGuardParams); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing guard: err = %v", err)
+	}
+	handle := fwkplugin.NewEppHandle(context.Background(), nil)
+	handle.AddPlugin(testGuardName, newTestScreener(prefixAffinityConfig("")))
+	config = overflowConfig()
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	screener := newScreener("test-screener", config, labels.Everything(), handle)
+	if err := screener.resolveOverflowGuard(); err == nil || !strings.Contains(err.Error(), "not a scheduling filter") {
+		t.Fatalf("non-filter guard: err = %v", err)
 	}
 }
 
@@ -212,7 +271,10 @@ func TestOverflowSendsNoRequestToAFullRevisionWhileAnotherHasRoom(t *testing.T) 
 func TestOverflowSpreadsOverTheRemainingRevisionsByShare(t *testing.T) {
 	config := overflowConfig()
 	config.RevisionGating.Mode = GatingModeMaxRole
-	screener := newTestScreener(config)
+	screener, err := newGuardedScreener(t, config, testGuardParams)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// a (full) holds 1 of 9 decode Pods; b and c hold 4 each.
 	seedCounts(t, screener, map[string]map[string]int{
 		"a": {"prefill": 1, "decode": 1},
@@ -296,5 +358,16 @@ func TestOverflowMetricIsDeletedWithItsRevision(t *testing.T) {
 	}
 	if n := testutil.CollectAndCount(revisionOverflowTotal); n != 0 {
 		t.Fatalf("overflow series of a removed revision must be deleted, %d left", n)
+	}
+}
+
+func TestConfigParserExposesTheGuardAsADependency(t *testing.T) {
+	parsed, err := ConfigParser(json.NewDecoder(strings.NewReader(
+		`{"revisionGating": {"mode": "sum", "overflow": {"guardPluginName": "prefill-guard"}}}`)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.(*Config).RevisionGating.Overflow.GuardPluginName; got != "prefill-guard" {
+		t.Fatalf("guardPluginName = %q", got)
 	}
 }
