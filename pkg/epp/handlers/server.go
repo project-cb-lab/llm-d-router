@@ -171,6 +171,10 @@ type RequestContext struct {
 	responseStatusCode         string
 	requestRunning             bool
 
+	// sseLineCarry is the partial last SSE line of the previous response chunk.
+	sseLineCarry      []byte
+	sseLineDiscarding bool
+
 	// responseProcessingDuration is the EPP cost of handling the response. For a
 	// streamed response it is the sum of the per-chunk handler slices, since the
 	// gaps between chunks are model server generation time. For a non-streaming

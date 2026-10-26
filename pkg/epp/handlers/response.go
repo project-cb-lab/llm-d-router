@@ -18,8 +18,10 @@ limitations under the License.
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	configPb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -29,6 +31,8 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/envoy"
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	fwkrequest "github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
@@ -73,12 +77,16 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 	}
 
 	var parsedResp *fwkrh.ParsedResponse
+	parseBytes := responseBytes
+	if isEventStream(reqCtx.Response.Headers) {
+		parseBytes = completeSSELines(ctx, reqCtx, responseBytes, endOfStream)
+	}
 	parser, err := s.getOrResolveParser(reqCtx)
 	if err != nil {
 		logger.Error(err, "parsing response: failed to resolve parser")
-	} else {
+	} else if len(parseBytes) > 0 || endOfStream {
 		before := time.Now()
-		parsedResp, err = parser.ParseResponse(ctx, responseBytes, reqCtx.Response.Headers, endOfStream)
+		parsedResp, err = parser.ParseResponse(ctx, parseBytes, reqCtx.Response.Headers, endOfStream)
 		metrics.RecordPluginProcessingLatency(fwkrh.ResponseParsingExtensionPoint, parser.TypedName().Type, parser.TypedName().Name, time.Since(before))
 		if err != nil {
 			logger.Error(err, "parsing response")
@@ -107,6 +115,56 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 		metrics.RecordRequestTPOT(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.modelServerStreaming, reqCtx.RequestReceivedTimestamp, reqCtx.firstTokenTimestamp, reqCtx.responseCompleteTimestamp, reqCtx.Usage.CompletionTokens)
 	}
 	return s.director.HandleResponseBody(ctx, reqCtx, endOfStream)
+}
+
+// maxSSELineBytes caps one buffered SSE line. It is above the tool-calling 1 MiB event cap
+// because response.completed repeats the request's instructions and tools plus all output.
+const maxSSELineBytes = 4 << 20
+
+func isEventStream(headers map[string]string) bool {
+	mediaType, _, _ := strings.Cut(headers[reqcommon.HeaderContentType], ";")
+	return strings.EqualFold(strings.TrimSpace(mediaType), fwkrequest.MediaTypeEventStream)
+}
+
+// completeSSELines returns only whole lines, carrying a partial last line to the next chunk.
+// A line longer than maxSSELineBytes is dropped up to its newline.
+func completeSSELines(ctx context.Context, reqCtx *RequestContext, chunk []byte, endOfStream bool) []byte {
+	if reqCtx.sseLineDiscarding {
+		lineEnd := bytes.IndexByte(chunk, '\n')
+		if lineEnd < 0 {
+			return nil
+		}
+		reqCtx.sseLineDiscarding = false
+		chunk = chunk[lineEnd+1:]
+	}
+	if endOfStream {
+		carry := reqCtx.sseLineCarry
+		reqCtx.sseLineCarry = nil
+		return append(carry, chunk...)
+	}
+	lineEnd := bytes.LastIndexByte(chunk, '\n')
+	if lineEnd < 0 {
+		if len(reqCtx.sseLineCarry)+len(chunk) > maxSSELineBytes {
+			log.FromContext(ctx).V(logutil.DEBUG).Info("dropping oversized SSE line from response parsing", "limit", maxSSELineBytes)
+			reqCtx.sseLineCarry = nil
+			reqCtx.sseLineDiscarding = true
+			return nil
+		}
+		// Appending to the carry grows it in place, keeping a line spread over many chunks linear.
+		reqCtx.sseLineCarry = append(reqCtx.sseLineCarry, chunk...)
+		return nil
+	}
+	data := chunk[:lineEnd+1]
+	if len(reqCtx.sseLineCarry) > 0 {
+		data = append(reqCtx.sseLineCarry, data...)
+	}
+	reqCtx.sseLineCarry = nil
+	if tail := chunk[lineEnd+1:]; len(tail) > maxSSELineBytes {
+		reqCtx.sseLineDiscarding = true
+	} else if len(tail) > 0 {
+		reqCtx.sseLineCarry = bytes.Clone(tail)
+	}
+	return data
 }
 
 // mergeUsage folds a parsed usage block into the usage accumulated for the request.
