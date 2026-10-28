@@ -19,6 +19,8 @@ package handlers
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -406,6 +408,23 @@ func TestHandleResponseBodyModelStreaming_TokenAccumulation(t *testing.T) {
 			wantUsage: fwkrh.Usage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15},
 		},
 		{
+			name: "Split mid-event: usage line cut across chunks",
+			chunks: []chunkStream{
+				{body: []byte(`data: {"choices":[{"text":"Hello"}]}` + "\n" + `data: {"usage":{"prompt_tok`), endOfStream: false},
+				{body: []byte(`ens":5,"completion_tokens":10,"total_tokens":15}}` + "\n"), endOfStream: false},
+				{body: []byte(`data: [DONE]`), endOfStream: true},
+			},
+			wantUsage: fwkrh.Usage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15},
+		},
+		{
+			name: "Split mid-event: usage line ends at end of stream without newline",
+			chunks: []chunkStream{
+				{body: []byte(`data: {"usage":{"prompt_tokens":5,`), endOfStream: false},
+				{body: []byte(`"completion_tokens":10,"total_tokens":15}}`), endOfStream: true},
+			},
+			wantUsage: fwkrh.Usage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15},
+		},
+		{
 			name: "No Usage Data",
 			chunks: []chunkStream{
 				{body: []byte(`data: {"choices":[{"text":"Hello"}]}` + "\n"), endOfStream: false},
@@ -437,6 +456,92 @@ func TestHandleResponseBodyModelStreaming_TokenAccumulation(t *testing.T) {
 			assert.Equal(t, tc.wantUsage, reqCtx.Usage, "Usage data should match expected accumulation")
 		})
 	}
+}
+
+// A large response.completed event split across chunks must still yield usage.
+func TestHandleResponseBodyModelStreaming_LargeResponsesCompletedSplit(t *testing.T) {
+	t.Parallel()
+
+	stream := "event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"instructions":"` + strings.Repeat("x", 200_000) +
+		`","usage":{"input_tokens":290000,"output_tokens":900,"total_tokens":290900}}}` + "\n\n"
+	want := fwkrh.Usage{PromptTokens: 290000, CompletionTokens: 900, TotalTokens: 290900}
+
+	for _, chunkSize := range []int{len(stream), 65536, 16384, 1000} {
+		t.Run(strconv.Itoa(chunkSize), func(t *testing.T) {
+			server := &StreamingServer{
+				parserRegistry: NewParserRegistry([]fwkrh.Parser{openai.NewOpenAIParser()}, logr.Discard()),
+				director:       &mockDirector{},
+			}
+			reqCtx := &RequestContext{
+				Response:          &Response{Headers: map[string]string{"content-type": "text/event-stream"}},
+				SchedulingRequest: &fwksched.InferenceRequest{FairnessID: reqcommon.DefaultFairnessID},
+			}
+			for i := 0; i < len(stream); i += chunkSize {
+				end := min(i+chunkSize, len(stream))
+				server.HandleResponseBody(context.Background(), reqCtx, []byte(stream[i:end]), end == len(stream))
+			}
+			assert.Equal(t, want.PromptTokens, reqCtx.Usage.PromptTokens)
+			assert.Equal(t, want.CompletionTokens, reqCtx.Usage.CompletionTokens)
+			assert.Equal(t, 2, reqCtx.StreamedEvents)
+		})
+	}
+}
+
+func TestCompleteSSELines(t *testing.T) {
+	t.Parallel()
+
+	oversized := strings.Repeat("x", maxSSELineBytes)
+	tests := []struct {
+		name   string
+		chunks []string
+		want   []string // parser input per chunk
+	}{
+		{
+			name:   "partial line carried to the next chunk",
+			chunks: []string{"a\nb", "c", "d\ne", "f"},
+			want:   []string{"a\n", "", "bcd\n", "ef"},
+		},
+		{
+			name:   "final chunk returned whole with the carry",
+			chunks: []string{"a\nb", "c\nd"},
+			want:   []string{"a\n", "bc\nd"},
+		},
+		{
+			name:   "oversized line dropped up to its newline",
+			chunks: []string{"a\n" + oversized, "x", "tail\nb\n", "c"},
+			want:   []string{"a\n", "", "b\n", "c"},
+		},
+		{
+			name:   "oversized tail in one chunk dropped up to its newline",
+			chunks: []string{"a\n" + oversized + "x", "tail\nb\n", "c"},
+			want:   []string{"a\n", "b\n", "c"},
+		},
+		{
+			name:   "oversized last line at end of stream dropped",
+			chunks: []string{"a\n" + oversized, "x"},
+			want:   []string{"a\n", ""},
+		},
+		{
+			name:   "oversized tail of the final chunk dropped",
+			chunks: []string{"a\n", "b\n" + oversized + "x"},
+			want:   []string{"a\n", "b\n"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reqCtx := &RequestContext{}
+			for i, chunk := range tc.chunks {
+				got := completeSSELines(context.Background(), reqCtx, []byte(chunk), i == len(tc.chunks)-1)
+				assert.Equal(t, tc.want[i], string(got), "chunk %d", i)
+			}
+		})
+	}
+
+	assert.True(t, isEventStream("text/event-stream; charset=utf-8"))
+	assert.False(t, isEventStream("application/grpc"))
 }
 
 // The Anthropic streaming format reports prompt tokens in message_start and completion

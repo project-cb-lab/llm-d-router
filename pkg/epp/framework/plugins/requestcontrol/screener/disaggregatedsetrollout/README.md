@@ -106,7 +106,9 @@ revision header, the plugin then:
 1. Removes every revision that has no Ready Pod for any required role, because
    a revision missing one role cannot serve the request.
 2. Computes a weight for each remaining revision.
-3. Randomly chooses one candidate revision using those weights.
+3. Chooses one candidate revision using those weights. The draw is random, or
+   keyed on the request when [revision affinity](#revision-affinity) is
+   enabled.
 4. When Pods from multiple revisions are observed and `disableCoordination` is
    false, atomically stores or reads the revision decision through the
    configured `CrossReplicaSyncer`, keyed by `x-llm-d-revision-decision-id` or
@@ -326,6 +328,100 @@ request. Do not add it to a scheduling profile.
 | `revisionGating.revisionLabelKey` | string | No | `disaggregatedset.x-k8s.io/revision` | Label identifying a rollout revision. |
 | `revisionGating.roleLabelKey` | string | No | `disaggregatedset.x-k8s.io/role` | Label identifying a Pod role. |
 | `revisionGating.disableCoordination` | boolean | No | `false` | Disables coordination of rollout revisions across parallel requests. Set only for known sequential P/D deployments; E/P/D requires coordination. |
+| `revisionGating.affinity.mode` | string | No | `none` | `none` draws each request's revision at random. `prefix` keys the draw on the session header or conversation prefix; see [Revision Affinity](#revision-affinity). |
+| `revisionGating.affinity.sessionHeader` | string | No | | With `prefix`, a request header whose value keys the draw when present, ahead of the conversation prefix. |
+| `revisionGating.overflow.guardPluginName` | string | No | | Enables overflow: when this filter admits no endpoint of `overflow.role` in the drawn revision, the request goes to a revision where it admits one; see [Revision Overflow](#revision-overflow). A fail-closed scheduling filter. |
+| `revisionGating.overflow.role` | string | No | `prefill` | The role whose endpoints must have room; one of `requiredRoles`. |
+
+## Revision Affinity
+
+With the default random draw, consecutive turns of one session land on the old
+and new revisions roughly in proportion to their shares. Each switch lands on a
+revision that does not hold the session's KV cache, so the prefix is
+recomputed, and under load the two revisions keep evicting each other's working
+sets for the whole rollout.
+
+`affinity.mode: prefix` replaces the random number with a hash of the request,
+mapped onto the same weighted ranges:
+
+```yaml
+    revisionGating:
+      mode: max-role
+      requiredRoles: [prefill, decode]
+      affinity:
+        mode: prefix
+        sessionHeader: x-session-id   # optional
+```
+
+- The key is the `sessionHeader` value when it is configured and present.
+  Otherwise it is the conversation up to and including its first user message
+  (plus `cache_salt`), for OpenAI chat completions and Anthropic messages.
+  Later turns repeat that prefix, so all turns of a session select the same
+  revision, while sessions that share only a system prompt still spread out.
+- Requests with nothing to key on fall back to the random draw: completions,
+  Responses, and other bodies without a message list, and chat requests with no
+  messages.
+- Shares still hold in aggregate across many keys. With two revisions, a share
+  change moves only the keys between the old and new boundary, and always toward
+  the revision that gained share, so every other session keeps its revision and
+  its cache for the rest of the rollout.
+- A strict revision header still takes precedence, and coordination for
+  parallel requests is unchanged.
+
+The split is per key, not per request. A key that carries a large fraction of
+the traffic, such as a session header shared by many clients, sends all of that
+traffic to one revision. Leave affinity off when a few keys dominate traffic.
+
+## Revision Overflow
+
+Flow control admits on the average load of the whole pool, so during a rollout
+one revision can be full while the other has room. A fail-closed concurrency
+filter then rejects the request with HTTP 429 although capacity exists.
+
+```yaml
+    - type: concurrency-detector
+      name: prefill-concurrency-guard
+      parameters:
+        maxConcurrency: 8
+        headroom: 0.5
+        failOpen: false
+    - type: disaggregatedset-rollout-screener
+      parameters:
+        revisionGating:
+          mode: max-role
+          requiredRoles: [prefill, decode]
+          overflow:
+            guardPluginName: prefill-concurrency-guard
+```
+
+- Use the same guard plugin as the prefill profile's filter, so the Screener
+  and the profile decide room alike.
+- After drawing a revision, the Screener runs the guard on the endpoints of
+  `overflow.role` in the drawn revision. When it admits none, the request goes
+  to a revision where it admits one, drawn over those revisions' shares. The
+  limits stay in the guard's config, so the two cannot drift apart. Only
+  endpoints in `scope` count as room.
+- The guard must fail closed: a filter that returns every endpoint when all
+  are full never shows a full revision. A `concurrency-detector` with
+  `failOpen` unset or `true` is rejected at startup.
+- Nothing is stored: the next request is drawn again as usual, so only the
+  overflowed request leaves the drawn revision.
+- When no revision has room, the drawn revision is kept. A strict revision
+  header is never overridden.
+- The guard runs before the data producers, so a token limit sees the
+  endpoint's in-flight tokens but not the uncached tokens of this request. A
+  full endpoint of another role (for example decode) does not trigger
+  overflow.
+- The Screener runs before the P/D decider, so it checks prefill room even for
+  a request the decider will later serve decode-only; with an always-disaggregate
+  decider every request uses prefill. It also sees the endpoints before other
+  Screeners narrow them.
+- Coordination wins over overflow. When a request is screened again under a
+  decision ID that already holds a revision (the phases of one P/D or E/P/D
+  request, or a proxy retry that keeps `x-request-id`), it gets that revision
+  even if it is full, so every part of the request stays on one revision.
+- `llm_d_router_endpoint_picker_disaggregatedset_revision_overflow_total`
+  counts overflows by source and target revision, once per decision.
 
 ## DisaggregatedSet Slice Affinity
 

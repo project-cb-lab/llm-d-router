@@ -171,6 +171,10 @@ type RequestContext struct {
 	responseStatusCode         string
 	requestRunning             bool
 
+	// sseLineCarry is the partial last SSE line of the previous response chunk.
+	sseLineCarry      []byte
+	sseLineDiscarding bool
+
 	// responseProcessingDuration is the EPP cost of handling the response. For a
 	// streamed response it is the sum of the per-chunk handler slices, since the
 	// gaps between chunks are model server generation time. For a non-streaming
@@ -677,7 +681,10 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				// Envoy sends the response status as the ":status" pseudo-header.
 				if (header.Key == ":status" || header.Key == "status") && string(header.RawValue) != "200" {
 					reqCtx.responseStatusCode = errcommon.ModelServerError
-				} else if header.Key == reqcommon.HeaderContentType && strings.Contains(string(header.RawValue), fwkrequest.MediaTypeEventStream) {
+				} else if header.Key == reqcommon.HeaderContentType {
+					if !isEventStream(envoy.GetHeaderValue(header)) {
+						continue
+					}
 					reqCtx.modelServerStreaming = true
 					if traceEnabled {
 						loggerTrace.Info("model server is streaming response")
