@@ -505,9 +505,29 @@ func TestCompleteSSELines(t *testing.T) {
 			want:   []string{"a\n", "", "bcd\n", "ef"},
 		},
 		{
+			name:   "final chunk returned whole with the carry",
+			chunks: []string{"a\nb", "c\nd"},
+			want:   []string{"a\n", "bc\nd"},
+		},
+		{
 			name:   "oversized line dropped up to its newline",
 			chunks: []string{"a\n" + oversized, "x", "tail\nb\n", "c"},
 			want:   []string{"a\n", "", "b\n", "c"},
+		},
+		{
+			name:   "oversized tail in one chunk dropped up to its newline",
+			chunks: []string{"a\n" + oversized + "x", "tail\nb\n", "c"},
+			want:   []string{"a\n", "b\n", "c"},
+		},
+		{
+			name:   "oversized last line at end of stream dropped",
+			chunks: []string{"a\n" + oversized, "x"},
+			want:   []string{"a\n", ""},
+		},
+		{
+			name:   "oversized tail of the final chunk dropped",
+			chunks: []string{"a\n", "b\n" + oversized + "x"},
+			want:   []string{"a\n", "b\n"},
 		},
 	}
 	for _, tc := range tests {
@@ -520,8 +540,8 @@ func TestCompleteSSELines(t *testing.T) {
 		})
 	}
 
-	assert.True(t, isEventStream(map[string]string{"content-type": "text/event-stream; charset=utf-8"}))
-	assert.False(t, isEventStream(map[string]string{"content-type": "application/grpc"}))
+	assert.True(t, isEventStream("text/event-stream; charset=utf-8"))
+	assert.False(t, isEventStream("application/grpc"))
 }
 
 // The Anthropic streaming format reports prompt tokens in message_start and completion

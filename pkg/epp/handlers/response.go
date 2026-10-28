@@ -78,7 +78,7 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 
 	var parsedResp *fwkrh.ParsedResponse
 	parseBytes := responseBytes
-	if isEventStream(reqCtx.Response.Headers) {
+	if isEventStream(reqCtx.Response.Headers[reqcommon.HeaderContentType]) {
 		parseBytes = completeSSELines(ctx, reqCtx, responseBytes, endOfStream)
 	}
 	parser, err := s.getOrResolveParser(reqCtx)
@@ -121,8 +121,9 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 // because response.completed repeats the request's instructions and tools plus all output.
 const maxSSELineBytes = 4 << 20
 
-func isEventStream(headers map[string]string) bool {
-	mediaType, _, _ := strings.Cut(headers[reqcommon.HeaderContentType], ";")
+// isEventStream reports whether a content-type header value is text/event-stream.
+func isEventStream(contentType string) bool {
+	mediaType, _, _ := strings.Cut(contentType, ";")
 	return strings.EqualFold(strings.TrimSpace(mediaType), fwkrequest.MediaTypeEventStream)
 }
 
@@ -137,21 +138,19 @@ func completeSSELines(ctx context.Context, reqCtx *RequestContext, chunk []byte,
 		reqCtx.sseLineDiscarding = false
 		chunk = chunk[lineEnd+1:]
 	}
-	if endOfStream {
-		carry := reqCtx.sseLineCarry
-		reqCtx.sseLineCarry = nil
-		return append(carry, chunk...)
-	}
 	lineEnd := bytes.LastIndexByte(chunk, '\n')
 	if lineEnd < 0 {
 		if len(reqCtx.sseLineCarry)+len(chunk) > maxSSELineBytes {
-			log.FromContext(ctx).V(logutil.DEBUG).Info("dropping oversized SSE line from response parsing", "limit", maxSSELineBytes)
-			reqCtx.sseLineCarry = nil
-			reqCtx.sseLineDiscarding = true
+			dropSSELine(ctx, reqCtx, endOfStream)
 			return nil
 		}
 		// Appending to the carry grows it in place, keeping a line spread over many chunks linear.
 		reqCtx.sseLineCarry = append(reqCtx.sseLineCarry, chunk...)
+		if endOfStream {
+			carry := reqCtx.sseLineCarry
+			reqCtx.sseLineCarry = nil
+			return carry
+		}
 		return nil
 	}
 	data := chunk[:lineEnd+1]
@@ -159,12 +158,23 @@ func completeSSELines(ctx context.Context, reqCtx *RequestContext, chunk []byte,
 		data = append(reqCtx.sseLineCarry, data...)
 	}
 	reqCtx.sseLineCarry = nil
-	if tail := chunk[lineEnd+1:]; len(tail) > maxSSELineBytes {
-		reqCtx.sseLineDiscarding = true
-	} else if len(tail) > 0 {
+	tail := chunk[lineEnd+1:]
+	switch {
+	case len(tail) > maxSSELineBytes:
+		dropSSELine(ctx, reqCtx, endOfStream)
+	case endOfStream:
+		data = append(data, tail...)
+	case len(tail) > 0:
 		reqCtx.sseLineCarry = bytes.Clone(tail)
 	}
 	return data
+}
+
+// dropSSELine drops the line being read and, mid-stream, skips the rest of it up to its newline.
+func dropSSELine(ctx context.Context, reqCtx *RequestContext, endOfStream bool) {
+	log.FromContext(ctx).V(logutil.DEFAULT).Info("dropping oversized SSE line from response parsing", "limit", maxSSELineBytes)
+	reqCtx.sseLineCarry = nil
+	reqCtx.sseLineDiscarding = !endOfStream
 }
 
 // mergeUsage folds a parsed usage block into the usage accumulated for the request.
