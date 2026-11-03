@@ -186,6 +186,7 @@ type Pool struct {
 	index          kvblock.Index
 	tokenProcessor kvblock.TokenProcessor
 	adapter        EngineAdapter
+	consumer       EventConsumer
 	groupCatalog   *kvblock.GroupCatalog
 	// dedup lives in the Pool, not as an Index decorator, because its scope is
 	// built from event fields absent from the Index.Evict signature (device
@@ -407,6 +408,13 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 			span.SetStatus(codes.Error, err.Error())
 		}
 		logger.Error(err, "Failed to parse message")
+		if p.consumer != nil {
+			source := msg.SourceEndpoint
+			if source == "" {
+				source = p.adapter.ShardingKey(msg)
+			}
+			p.clearPod(ctx, source, false)
+		}
 		return
 	}
 
@@ -420,6 +428,14 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 		)
 	}
 
+	if p.consumer != nil {
+		source := EventSource{Endpoint: podID, ModelName: modelName, Sequence: msg.Sequence}
+		if err := p.consumer.ProcessEvents(ctx, source, batch); err != nil {
+			logger.Error(err, "Failed to consume KV events", "endpoint", podID)
+			p.clearPod(ctx, podID, false)
+		}
+		return
+	}
 	p.processEventBatch(ctx, &batch, podID, modelName)
 }
 
@@ -448,6 +464,12 @@ func (p *Pool) decode(ctx context.Context, msg *RawMessage) (string, string, Eve
 }
 
 func (p *Pool) clearPod(ctx context.Context, podIdentifier string, retire bool) {
+	if p.consumer != nil {
+		if err := p.consumer.Reset(ctx, EventSource{Endpoint: podIdentifier, Retired: retire}); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to reset KV event consumer", "endpoint", podIdentifier)
+		}
+		return
+	}
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	if err := p.index.Clear(ctx, podIdentifier); err != nil {
 		debugLogger.Error(err, "Failed to clear pod from index",
@@ -563,6 +585,9 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 	for _, genericEvent := range batch.Events {
 		switch ev := genericEvent.(type) {
 		case *BlockStoredEvent:
+			// Metadata inference must not change the batch seen by other consumers.
+			stored := *ev
+			ev = &stored
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
 
 			// Scope for reference-counting this store against duplicate removes.
