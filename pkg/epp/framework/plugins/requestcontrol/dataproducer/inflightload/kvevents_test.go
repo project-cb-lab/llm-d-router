@@ -26,9 +26,11 @@ import (
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	testutils "github.com/llm-d/llm-d-router/test/utils"
@@ -405,6 +407,31 @@ func TestKVEventPrefillCompletion_SingleEngineCompletesOnItsOwnEvents(t *testing
 	require.Equal(t, int64(0), producer.tokenTracker.get(engineID))
 	require.Equal(t, int64(1), producer.requestTracker.get(engineID))
 	require.Equal(t, float64(1), completions(name, signalKVEvent))
+}
+
+func TestKVEventPrefillCompletion_RequiresVLLMTokenBackend(t *testing.T) {
+	t.Parallel()
+	ctx := testutils.NewTestContext(t)
+	newHandle := func(t *testing.T, tokenProducerConfig string) fwkplugin.Handle {
+		handle := fwkplugin.NewEppHandle(ctx, nil)
+		tp, err := tokenproducer.PluginFactory(tokenproducer.PluginType,
+			fwkplugin.StrictDecoder(json.RawMessage(tokenProducerConfig)), handle)
+		require.NoError(t, err)
+		handle.AddPlugin(tokenproducer.PluginType, tp)
+		return handle
+	}
+
+	handle := newHandle(t, `{"modelName":"test-model"}`)
+	handle.AddPlugin("kv-backend-vllm", newKVEventsProducer(t, "kv-backend-vllm"))
+	require.NoError(t, ValidateTokenProducer(handle))
+
+	handle = newHandle(t, `{}`)
+	handle.AddPlugin("kv-backend-estimate", newKVEventsProducer(t, "kv-backend-estimate"))
+	require.ErrorContains(t, ValidateTokenProducer(handle), tokenproducer.PluginType)
+
+	handle = newHandle(t, `{}`)
+	handle.AddPlugin("first-byte", newTestProducer(t))
+	require.NoError(t, ValidateTokenProducer(handle))
 }
 
 func TestKVEventPrefillCompletion_OffByDefault(t *testing.T) {

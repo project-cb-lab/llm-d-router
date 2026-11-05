@@ -903,6 +903,9 @@ func (r *Runner) parseConfigurationPhaseTwo(ctx context.Context, rawConfig *conf
 	if err := preciseproducer.ValidateTokenProducer(handle); err != nil {
 		return nil, fmt.Errorf("invalid configuration - %w", err)
 	}
+	if err := inflightload.ValidateTokenProducer(handle); err != nil {
+		return nil, fmt.Errorf("invalid configuration - %w", err)
+	}
 
 	// Add requestControl plugins
 	r.requestControlConfig.AddPlugins(handle.GetAllPlugins()...)

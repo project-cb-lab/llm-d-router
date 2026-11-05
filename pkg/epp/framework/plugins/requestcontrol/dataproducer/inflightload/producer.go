@@ -745,6 +745,30 @@ func (p *InFlightLoadProducer) Produces() map[fwkplugin.DataKey]any {
 	}
 }
 
+// ValidateTokenProducer verifies that an in-flight load producer completing
+// prefill from KV events reads token ids from a vllm-backed token-producer.
+// The event match compares the request's token ids with the engine's, so
+// estimated ids never complete a request. Like the precise-prefix-cache check,
+// it runs at the runner level after auto-defaults.
+func ValidateTokenProducer(handle fwkplugin.Handle) error {
+	needsVLLM := false
+	for _, p := range handle.GetAllPlugins() {
+		if producer, ok := p.(*InFlightLoadProducer); ok && producer.prefillFromKVEvents {
+			needsVLLM = true
+			break
+		}
+	}
+	if !needsVLLM {
+		return nil
+	}
+	tp, ok := handle.Plugin(tokenproducer.PluginType).(*tokenproducer.Plugin)
+	if !ok || tp.Backend() != tokenproducer.BackendVLLM {
+		return fmt.Errorf("%s with prefillCompletionFromKVEvents requires a %s plugin with a vllm backend",
+			InFlightLoadProducerType, tokenproducer.PluginType)
+	}
+	return nil
+}
+
 // Consumes declares TokenizedRequest as required so the data-layer DAG orders a
 // token-producer ahead of this producer and auto-creates one when none is
 // configured; without it the input-token estimate silently reads zero.
