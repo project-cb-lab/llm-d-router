@@ -16,6 +16,10 @@ prefixes. After scheduling, the header is set only when the sampled source
 out-caches the computing endpoint by at least `minCachedTokenDelta` tokens.
 Any inbound value of the header is removed.
 
+The decision for the request (`P2PSourceDecision`: the `outcome` and `endpoint_role` of
+`llm_d_epp_p2p_source_decisions_total`) is stored as a request attribute, read by a
+`prefix-cache-affinity-filter` whose `p2pSourceProducerName` names this instance.
+
 ## Reusable Prefix Floor
 
 Per-tier cache data distinguishes the source's pull-servable CPU blocks from
