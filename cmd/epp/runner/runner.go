@@ -81,6 +81,7 @@ import (
 	extmodels "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/models"
 	exttopology "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/topology"
 	srcdcgm "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/dcgm"
+	srckvevents "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/kvevents"
 	sourcemetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/metrics"
 	srcmodels "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/models"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
@@ -787,6 +788,7 @@ func (r *Runner) registerInTreePlugins() {
 	// Beta
 	fwkplugin.Register(sourcenotifications.NotificationSourceType, fwkplugin.StabilityBeta, sourcenotifications.NotificationSourceFactory)
 	fwkplugin.Register(sourcenotifications.EndpointNotificationSourceType, fwkplugin.StabilityBeta, sourcenotifications.EndpointSourceFactory)
+	fwkplugin.Register(srckvevents.PluginType, fwkplugin.StabilityAlpha, srckvevents.Factory)
 
 	// register request control plugins
 	// Beta
@@ -899,6 +901,9 @@ func (r *Runner) parseConfigurationPhaseTwo(ctx context.Context, rawConfig *conf
 	// the estimate backend) is caught; the check is independent of factory
 	// instantiation order. See #1471.
 	if err := preciseproducer.ValidateTokenProducer(handle); err != nil {
+		return nil, fmt.Errorf("invalid configuration - %w", err)
+	}
+	if err := inflightload.ValidateTokenProducer(handle); err != nil {
 		return nil, fmt.Errorf("invalid configuration - %w", err)
 	}
 

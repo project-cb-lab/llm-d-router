@@ -170,12 +170,17 @@ var blockStoredFieldDecoders = []vllmFieldDecoder{
 	{"group_idx", decodeGroupIdx},
 	{"kv_cache_spec_kind", decodeKVCacheSpecKind},
 	{"kv_cache_spec_sliding_window", decodeSlidingWindow},
+	{"locality", decodeLocality},
+	{"ownership", decodeOwnership},
+	{"session_id", decodeSessionID},
 }
 
 var blockRemovedFieldDecoders = []vllmFieldDecoder{
 	blockStoredFieldDecoders[0],
 	blockStoredFieldDecoders[5],
 	blockStoredFieldDecoders[8],
+	{"locality", decodeLocality},
+	{"ownership", decodeOwnership},
 }
 
 func vllmFieldDecoders(tag string) []vllmFieldDecoder {
@@ -260,6 +265,9 @@ func decodeBlockSizeField(dec *msgpack.Decoder, fields *vllmEventFields) error {
 }
 
 type vllmEventFields struct {
+	sessionID     *string
+	locality      string
+	ownership     string
 	tag           string
 	hasTag        bool
 	blockHashes   []uint64
@@ -450,6 +458,9 @@ func (f *vllmEventFields) requireBlockStoredFields() error {
 
 func (f *vllmEventFields) blockStoredEvent() *kvevents.BlockStoredEvent {
 	return &kvevents.BlockStoredEvent{
+		SessionID:                    f.sessionID,
+		Locality:                     f.locality,
+		Ownership:                    f.ownership,
 		BlockHashes:                  f.blockHashes,
 		Tokens:                       f.tokens,
 		ParentHash:                   f.parentHash,
@@ -466,6 +477,8 @@ func (f *vllmEventFields) blockStoredEvent() *kvevents.BlockStoredEvent {
 
 func (f *vllmEventFields) blockRemovedEvent() *kvevents.BlockRemovedEvent {
 	return &kvevents.BlockRemovedEvent{
+		Locality:    f.locality,
+		Ownership:   f.ownership,
 		BlockHashes: f.blockHashes,
 		DeviceTier:  f.medium,
 		GroupIdx:    f.groupIdx,
@@ -658,6 +671,37 @@ func decodeLoraName(dec *msgpack.Decoder, fields *vllmEventFields) error {
 		return fmt.Errorf("lora_name is not a string: %w", err)
 	}
 	fields.loraName = value
+	return nil
+}
+
+func decodeLocality(dec *msgpack.Decoder, fields *vllmEventFields) error {
+	value, err := decodeOptionalString(dec)
+	if err != nil {
+		return fmt.Errorf("locality is not a string: %w", err)
+	}
+	if value != nil {
+		fields.locality = *value
+	}
+	return nil
+}
+
+func decodeOwnership(dec *msgpack.Decoder, fields *vllmEventFields) error {
+	value, err := decodeOptionalString(dec)
+	if err != nil {
+		return fmt.Errorf("ownership is not a string: %w", err)
+	}
+	if value != nil {
+		fields.ownership = *value
+	}
+	return nil
+}
+
+func decodeSessionID(dec *msgpack.Decoder, fields *vllmEventFields) error {
+	value, err := decodeOptionalString(dec)
+	if err != nil {
+		return fmt.Errorf("session_id is not a string: %w", err)
+	}
+	fields.sessionID = value
 	return nil
 }
 
