@@ -16,6 +16,10 @@ prefixes. After scheduling, the header is set only when the sampled source
 out-caches the computing endpoint by at least `minCachedTokenDelta` tokens.
 Any inbound value of the header is removed.
 
+The decision for the request (`P2PSourceDecision`: the `outcome` and `endpoint_role` of
+`llm_d_epp_p2p_source_decisions_total`) is stored as a request attribute, read by a
+`prefix-cache-affinity-filter` whose `p2pSourceProducerName` names this instance.
+
 ## Reusable Prefix Floor
 
 Per-tier cache data distinguishes the source's pull-servable CPU blocks from
@@ -149,6 +153,17 @@ serve and pull the named blocks:
 
 For cache-aware prefill-work routing, follow the
 [`context-length-aware` profile and work-range guidance](../../../scheduling/scorer/contextlengthaware/README.md#p2p-cache-aware-prefill-work).
+
+## Metrics
+
+- `llm_d_epp_p2p_source_decisions_total`: one decision per request, labelled by `endpoint_role` and `outcome`
+  (`pulled`, `self`, `below-floor`, `declined`, and the cases that leave no decision to make).
+- `llm_d_epp_p2p_source_predicted_pulled_tokens`: prompt tokens the selected source holds beyond
+  the computing endpoint, per request sent to pull.
+
+See [P2P KV-cache source](../../../../../../../docs/metrics.md#p2p-kv-cache-source) for every
+outcome, how `endpoint_role` is assigned under a renamed prefill profile, and the vLLM metrics that
+report the pulls served.
 
 ## Related Documentation
 

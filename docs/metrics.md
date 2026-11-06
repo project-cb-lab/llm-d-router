@@ -349,6 +349,62 @@ self-consistent, but CJK, code, and chat-template-heavy inputs shift it against 
 compare with these metrics: it counts blocks rather than tokens, only the precise producer feeds it,
 and it accumulates once per prompt rather than once per request.
 
+### P2P KV-cache source
+
+The `p2p-source-producer` emits these metrics, labelled by the producer instance. Each request that
+reaches its `PreRequest` records one decision.
+
+| Full metric name | Type | Labels | Notes |
+|---|---|---|---|
+| `llm_d_epp_p2p_source_decisions_total` | Counter | `plugin_name`, `endpoint_role`, `outcome` | One per request, with the outcome the producer's `p2p decision` log line names. |
+| `llm_d_epp_p2p_source_predicted_pulled_tokens` | Histogram | `plugin_name`, `endpoint_role` | Prompt tokens the selected source holds beyond the endpoint computing the prefix, per request sent to pull. |
+
+A request records the first outcome in this table that applies to it.
+
+| `outcome` | Meaning |
+|---|---|
+| `no-best-match` | No candidate held a cached prefix to pull. |
+| `no-endpoint` | No computing endpoint is available, or the selected endpoint has no metadata. |
+| `self` | The best-cached endpoint is the endpoint selected to compute the prefix. |
+| `below-floor` | The source holds fewer than `minCachedTokenDelta` tokens beyond the computing endpoint. |
+| `declined` | The cost model priced the pull at or above the prefill time it saves. |
+| `pulled` | The request carries the source header. |
+
+`endpoint_role` follows the prefix cache prediction metrics: `prefill` for a request with a target in
+the profile named `prefill`, `decode` otherwise when the primary profile has a target, and empty when
+neither has one. The role does not read `prefillProfileName`. On a P/D deployment whose prefill
+profile has another name, both metric families label its requests `decode`, where the P2P metrics
+describe the prefill endpoint and the prefix cache prediction metrics the decode endpoint.
+
+On an aggregated deployment, or a P/D deployment whose prefill profile is named `prefill`, the share
+of prompt tokens the router sent to pull is `llm_d_epp_p2p_source_predicted_pulled_tokens_sum`
+divided by `llm_d_epp_prefix_prompt_tokens_sum` of the prefix producer named in
+`prefixMatchInfoProducerName`, matched on `endpoint_role`. The share vLLM served from a peer is
+`vllm:prompt_tokens_cached_by_source_total{source="p2p"}` divided by `vllm:prompt_tokens_total` on the
+endpoints that compute the prefix, the prefill pods under P/D disaggregation. vLLM observes each
+promotion job from its P2P tier (`tier=~".*:p2p"`) in `vllm:kv_offload_tiering_promotion_latency_seconds`,
+labelled `result="success"` or `result="failure"`. As with the prefix prediction, the cohorts differ:
+a pull that fails or falls back to local prefill is counted on the router side only.
+
+### Prefix-cache affinity filter and P2P
+
+A `prefix-cache-affinity-filter` with `p2pSourceProducerName` set emits this counter, labelled by the
+filter instance. Each request the instance filtered that reaches `PreRequest` records one count.
+
+| Full metric name | Type | Labels | Notes |
+|---|---|---|---|
+| `llm_d_epp_prefix_cache_affinity_filter_p2p_decisions_total` | Counter | `plugin_name`, `endpoint_role`, `affinity_outcome`, `p2p_outcome` | The filter's outcome for the request, with the decision of the `p2p-source-producer` that `p2pSourceProducerName` names. |
+
+`affinity_outcome` is the filter's outcome, or `multiple` for a request the instance decided more
+than once because it runs in more than one scheduling profile. `p2p_outcome` and `endpoint_role` are
+the producer's `outcome` and `endpoint_role` (see [P2P KV-cache source](#p2p-kv-cache-source)).
+`p2p_outcome="unreported"` marks a request with no published P2P decision, and its `endpoint_role`
+is empty. A likely cause is a `p2pSourceProducerName` that names no configured `p2p-source-producer`,
+which startup accepts because the dependency is optional.
+
+`self` and `below-floor` occur whether or not the selected endpoint is in the filter's sticky set,
+so `p2p_outcome` does not show whether a `load_override` moved the request off it.
+
 ### Token producer render
 
 These metrics belong to the `token-producer` when it uses the vLLM render backend. The metric

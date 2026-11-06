@@ -37,6 +37,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	p2psourceconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/p2psource/constants"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixmetrics"
 )
 
 const (
@@ -48,6 +49,11 @@ const (
 	// prefix. Operators who rename it (disagg-profile-handler profiles.prefill)
 	// must set prefillProfileName to match.
 	defaultPrefillProfile = "prefill"
+
+	// prefixMetricsPrefillProfile is the prefill profile name the prefix-cache
+	// prediction metrics read. endpoint_role uses it, not prefillProfileName, so
+	// both metric families give a request the same role.
+	prefixMetricsPrefillProfile = "prefill"
 
 	defaultMinCachedTokenDelta = 1
 )
@@ -184,6 +190,7 @@ type Producer struct {
 	typedName                   plugin.TypedName
 	prefixMatchDataKey          plugin.DataKey
 	reusablePrefixTokensDataKey plugin.DataKey
+	decisionDataKey             plugin.DataKey
 	minCachedTokenDelta         int
 	prefillProfile              string
 	attrKeyValue                plugin.DataKey
@@ -192,7 +199,7 @@ type Producer struct {
 
 // PluginFactory parses the raw plugin configuration and returns a configured
 // Producer.
-func PluginFactory(name string, rawParameters *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
+func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	cfg := Config{MinCachedTokenDelta: defaultMinCachedTokenDelta}
 	if rawParameters != nil {
 		if err := rawParameters.Decode(&cfg); err != nil {
@@ -205,6 +212,11 @@ func PluginFactory(name string, rawParameters *json.Decoder, _ plugin.Handle) (p
 	if cfg.CostModel != nil {
 		if err := cfg.CostModel.validate(); err != nil {
 			return nil, fmt.Errorf("%s: %w", PluginType, err)
+		}
+	}
+	if handle != nil {
+		if err := registerMetrics(handle.Metrics()); err != nil {
+			return nil, err
 		}
 	}
 	return New(name, cfg), nil
@@ -231,6 +243,7 @@ func New(name string, cfg Config) *Producer {
 		typedName:                   plugin.TypedName{Type: PluginType, Name: name},
 		prefixMatchDataKey:          attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(cfg.PrefixMatchInfoProducerName),
 		reusablePrefixTokensDataKey: attrprefix.ReusablePrefixTokensDataKey.WithNonEmptyProducerName(name),
+		decisionDataKey:             attrprefix.P2PSourceDecisionDataKey.WithNonEmptyProducerName(name),
 		minCachedTokenDelta:         minCachedTokenDelta,
 		prefillProfile:              prefillProfile,
 		attrKeyValue:                plugin.NewDataKey("best-match", PluginType).WithNonEmptyProducerName(name),
@@ -241,14 +254,15 @@ func New(name string, cfg Config) *Producer {
 // TypedName returns the plugin's registered type and name.
 func (p *Producer) TypedName() plugin.TypedName { return p.typedName }
 
-// Produces declares the request-wide reusable prefix token floor, and the
+// Produces declares the request-wide reusable prefix token floor, the
 // best-match peer this plugin stashes on the request for its own PreRequest to
-// read back. Both keys are name-bound to this instance, so two configured
-// p2p-source producers do not share them.
+// read back, and the decision PreRequest publishes. All keys are name-bound to
+// this instance, so two configured p2p-source producers do not share them.
 func (p *Producer) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{
 		p.reusablePrefixTokensDataKey: attrprefix.ReusablePrefixTokens(0),
 		p.attrKeyValue:                (*bestMatchPeer)(nil),
+		p.decisionDataKey:             attrprefix.P2PSourceDecision{},
 	}
 }
 
@@ -435,17 +449,26 @@ func requestSpreadFraction(requestID string) float64 {
 func (p *Producer) PreRequest(ctx context.Context, request *scheduling.InferenceRequest, schedulingResult *scheduling.SchedulingResult) error {
 	routing.DeleteRoutingHeader(request.Headers, routing.KVCacheSourceHeader)
 
-	// One line per request with the decision and its inputs, so pull behavior
-	// can be joined to request latency without TRACE-level log volume. The
-	// inputs are collected only when the line is enabled.
+	// One decision count per request, the decision published on the request
+	// for a paired prefix-cache-affinity-filter, and one line with the decision
+	// and its inputs, so pull behavior can be joined to request latency without
+	// TRACE-level log volume. The inputs are collected only when the line is
+	// enabled.
 	dlog := log.FromContext(ctx).WithName(p.typedName.String()).V(logging.DEFAULT)
 	logDecision := dlog.Enabled()
 	outcome := "no-best-match"
 	var kv []any
 	if logDecision {
 		kv = []any{"requestID", request.RequestID}
-		defer func() { dlog.Info("p2p decision", append(kv, "outcome", outcome)...) }()
 	}
+	_, role := prefixmetrics.PredictionTarget(schedulingResult, prefixMetricsPrefillProfile)
+	defer func() {
+		recordDecision(p.typedName.Name, role, outcome)
+		request.PutAttribute(p.decisionDataKey, attrprefix.P2PSourceDecision{Outcome: outcome, EndpointRole: role})
+		if logDecision {
+			dlog.Info("p2p decision", append(kv, "outcome", outcome)...)
+		}
+	}()
 
 	best, ok := scheduling.ReadRequestAttribute[*bestMatchPeer](request, p.attrKey())
 	if !ok {
@@ -496,6 +519,7 @@ func (p *Producer) PreRequest(ctx context.Context, request *scheduling.Inference
 		}
 	}
 	outcome = "pulled"
+	recordPredictedPulledTokens(p.typedName.Name, role, delta)
 
 	if request.Headers == nil {
 		request.Headers = map[string]string{}
