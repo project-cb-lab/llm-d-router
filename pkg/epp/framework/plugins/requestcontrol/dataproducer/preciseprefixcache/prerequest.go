@@ -180,6 +180,8 @@ func (p *Producer) recordPrediction(ctx context.Context, request *scheduling.Inf
 // recordGPUMiss attributes the prompt tokens the chosen endpoint lacks in GPU
 // memory to where the index holds them. Without scored candidates or Produce
 // state the chosen endpoint stands in for the maxima, as in recordPrediction.
+// A filter is charged the drop in the best GPU-held prefix between the
+// endpoints it received and the endpoints it kept.
 func (p *Producer) recordGPUMiss(request *scheduling.InferenceRequest, profile *scheduling.ProfileRunResult,
 	role string, info *attrprefix.PrefixCacheMatchInfo,
 ) {
@@ -202,6 +204,22 @@ func (p *Producer) recordGPUMiss(request *scheduling.InferenceRequest, profile *
 		}
 		miss.BestAvailable = max(miss.BestPredicted, state.maxGPUCachedTokens)
 		miss.BestAvailableConfirmed = max(confirmed, state.maxConfirmedTokens)
+
+		kept := miss.BestPredicted
+		for i := len(profile.FilterEliminations) - 1; i >= 0; i-- {
+			elimination := profile.FilterEliminations[i]
+			received := kept
+			for _, endpoint := range elimination.Endpoints {
+				if md := endpoint.GetMetadata(); md != nil {
+					received = max(received, state.gpuCachedTokens[md.ID])
+				}
+			}
+			if received > kept {
+				miss.FilteredBy = append(miss.FilteredBy,
+					prefixmetrics.FilterTokens{Filter: elimination.Filter.Name, Tokens: received - kept})
+				kept = received
+			}
+		}
 	}
 	prefixmetrics.RecordGPUMiss(p.typedName.Name, p.typedName.Type, role, miss)
 }

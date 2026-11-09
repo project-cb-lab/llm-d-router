@@ -270,7 +270,7 @@ match data but is not instrumented here. Requests that reach no endpoint are not
 | `llm_d_epp_prefix_best_predicted_cached_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role`, `modality` | Highest such prediction among the endpoints the scheduler selected from. |
 | `llm_d_epp_prefix_best_available_cached_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role`, `modality` | Highest such prediction among the request's candidate endpoints before filtering. |
 | `llm_d_epp_prefix_prompt_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role`, `modality` | Prompt tokens the predictions were measured against. |
-| `llm_d_epp_prefix_gpu_miss_tokens_total` | Counter | `plugin_name`, `plugin_type`, `endpoint_role`, `reason` | Prompt tokens the chosen endpoint does not hold in GPU memory, by where the index holds them. Precise prefix-cache producer only. |
+| `llm_d_epp_prefix_gpu_miss_tokens_total` | Counter | `plugin_name`, `plugin_type`, `endpoint_role`, `reason`, `filter` | Prompt tokens the chosen endpoint does not hold in GPU memory, by where the index holds them. `filter` names the filter that removed the endpoint holding `filtered` tokens. Precise prefix-cache producer only. |
 | `llm_d_epp_prefix_mm_predicted_cached_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role` | Multimodal prompt tokens predicted to hit the chosen endpoint's prefix cache. |
 | `llm_d_epp_prefix_mm_prompt_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role` | Multimodal prompt tokens the multimodal prediction was measured against. |
 
@@ -328,9 +328,14 @@ were in the GPU memory of an endpoint that reached the picker and was not chosen
 placement. `lower_tier` tokens were in no endpoint's GPU memory and in a lower tier of the chosen
 endpoint, which is eviction the engine restores from. `peer_lower_tier` tokens were only in a lower
 tier of another endpoint, and `uncached` tokens were confirmed nowhere, which covers the new part of
-a prompt and prefixes every tier has evicted. Read `filtered` only for a producer whose index covers
-one role, because a decode pod holding the prefix in a shared index counts as removed by the role
-filter.
+a prompt and prefixes every tier has evicted.
+
+The `filter` label names the filter behind `filtered` tokens and is empty for every other reason.
+Each filter of the profile is charged the drop in the longest GPU-held prefix between the endpoints
+it received and the endpoints it kept, so a filter that removes an endpoint holding less than the
+best endpoint it kept is charged nothing. `filtered` tokens with an empty `filter` were on an
+endpoint the profile never received. With an index shared across roles, a decode pod holding the
+prefix is charged to the role filter of the prefill profile.
 
 Comparing these ratios is what the prediction metrics are for, subject to the limits below.
 

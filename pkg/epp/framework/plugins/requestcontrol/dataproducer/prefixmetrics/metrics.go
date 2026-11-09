@@ -110,10 +110,11 @@ var gpuMissTokens = prometheus.NewCounterVec(
 		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
 		Name:      "prefix_gpu_miss_tokens_total",
 		Help: metricsutil.HelpMsgWithStability(
-			"Prompt tokens the scheduler's chosen endpoint does not hold in GPU memory, by where the index holds them.",
+			"Prompt tokens the scheduler's chosen endpoint does not hold in GPU memory, by where the index holds them. "+
+				"filter names the filter that removed the endpoint holding filtered tokens.",
 			compbasemetrics.ALPHA),
 	},
-	[]string{"plugin_name", "plugin_type", "endpoint_role", "reason"},
+	[]string{"plugin_name", "plugin_type", "endpoint_role", "reason", "filter"},
 )
 
 var mmPredictedCachedTokens = prometheus.NewHistogramVec(
@@ -189,7 +190,8 @@ func RecordPrediction(pluginName, pluginType, role, modality string, p Predictio
 // GPUMiss is one request's prefix position in prompt tokens over the endpoint
 // sets of Prediction. Selected, BestPredicted and BestAvailable count the
 // contiguous prefix held in GPU memory, and the two Confirmed fields count the
-// contiguous prefix the engine confirmed in any device tier.
+// contiguous prefix the engine confirmed in any device tier. FilteredBy names
+// the filters behind the tokens between BestPredicted and BestAvailable.
 type GPUMiss struct {
 	Selected               int
 	BestPredicted          int
@@ -197,27 +199,43 @@ type GPUMiss struct {
 	SelectedConfirmed      int
 	BestAvailableConfirmed int
 	PromptTokens           int
+	FilteredBy             []FilterTokens
+}
+
+// FilterTokens is the GPU-held prefix tokens lost when Filter removed an
+// endpoint.
+type FilterTokens struct {
+	Filter string
+	Tokens int
 }
 
 // RecordGPUMiss splits the prompt tokens beyond m.Selected across the reasons,
 // so the reasons of one request sum to the prompt minus its GPU hit. Tokens in
 // another endpoint's GPU memory count as placement even when the chosen
-// endpoint holds them in a lower tier.
+// endpoint holds them in a lower tier. Filtered tokens carry the filter of
+// m.FilteredBy that accounts for them, and the rest an empty filter label.
 func RecordGPUMiss(pluginName, pluginType, role string, m GPUMiss) {
 	onChosen := max(m.BestAvailable, m.SelectedConfirmed)
 	onAnyEndpoint := max(onChosen, m.BestAvailableConfirmed)
+	unnamed := m.BestAvailable - m.BestPredicted
+	for _, part := range m.FilteredBy {
+		if part.Tokens > 0 {
+			gpuMissTokens.WithLabelValues(pluginName, pluginType, role, GPUMissFiltered, part.Filter).Add(float64(part.Tokens))
+			unnamed -= part.Tokens
+		}
+	}
 	for _, part := range []struct {
 		reason string
 		tokens int
 	}{
-		{GPUMissFiltered, m.BestAvailable - m.BestPredicted},
+		{GPUMissFiltered, unnamed},
 		{GPUMissNotPicked, m.BestPredicted - m.Selected},
 		{GPUMissLowerTier, onChosen - m.BestAvailable},
 		{GPUMissPeerLowerTier, onAnyEndpoint - onChosen},
 		{GPUMissUncached, m.PromptTokens - onAnyEndpoint},
 	} {
 		if part.tokens > 0 {
-			gpuMissTokens.WithLabelValues(pluginName, pluginType, role, part.reason).Add(float64(part.tokens))
+			gpuMissTokens.WithLabelValues(pluginName, pluginType, role, part.reason, "").Add(float64(part.tokens))
 		}
 	}
 }

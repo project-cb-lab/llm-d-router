@@ -132,7 +132,7 @@ func (p *SchedulerProfile) String() string {
 // Run runs a SchedulerProfile. It invokes all the SchedulerProfile plugins for the given request in this
 // order - Filters, Scorers, Picker. After completing all, it returns the result.
 func (p *SchedulerProfile) Run(ctx context.Context, request *fwksched.InferenceRequest, candidateEndpoints []fwksched.Endpoint) (*fwksched.ProfileRunResult, error) {
-	endpoints := p.runFilterPlugins(ctx, request, candidateEndpoints)
+	endpoints, eliminations := p.runFilterPlugins(ctx, request, candidateEndpoints)
 	if len(endpoints) == 0 {
 		return nil, errcommon.Error{
 			Code:    errcommon.ServiceUnavailable,
@@ -144,13 +144,19 @@ func (p *SchedulerProfile) Run(ctx context.Context, request *fwksched.InferenceR
 	weightedScorePerEndpoint := p.runScorerPlugins(ctx, request, endpoints)
 
 	result := p.runPickerPlugin(ctx, request, weightedScorePerEndpoint)
+	if result != nil {
+		result.FilterEliminations = eliminations
+	}
 
 	return result, nil
 }
 
-func (p *SchedulerProfile) runFilterPlugins(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+// runFilterPlugins returns the endpoints that pass every filter and the
+// endpoints each filter removed.
+func (p *SchedulerProfile) runFilterPlugins(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) ([]fwksched.Endpoint, []fwksched.FilterElimination) {
 	logger := log.FromContext(ctx)
 	filteredEndpoints := endpoints
+	var eliminations []fwksched.FilterElimination
 	debug := logger.V(logutil.DEBUG)
 	debugEnabled := debug.Enabled()
 	verbose := logger.V(logutil.VERBOSE)
@@ -181,9 +187,16 @@ func (p *SchedulerProfile) runFilterPlugins(ctx context.Context, request *fwksch
 		// surfaces in production. Producers run under executePluginsAsDAG, which
 		// does fail the request on one.
 		scopedRequest, scoped, _ := datalayer.ScopeInvocation(logger, filterExtensionPoint, filter, request, filteredEndpoints)
+		received := filteredEndpoints
 		before := time.Now()
 		filteredEndpoints = datalayer.Unscope(filter.Filter(ctx, scopedRequest, scoped))
 		metrics.RecordPluginProcessingLatency(filterExtensionPoint, typedName.Type, typedName.Name, time.Since(before))
+		if len(filteredEndpoints) < len(received) {
+			eliminations = append(eliminations, fwksched.FilterElimination{
+				Filter:    typedName,
+				Endpoints: removedEndpoints(received, filteredEndpoints),
+			})
+		}
 		if debugEnabled {
 			debug.Info("Completed running filter plugin successfully", "plugin", typedName, "endpoints", filteredEndpoints)
 		}
@@ -201,7 +214,22 @@ func (p *SchedulerProfile) runFilterPlugins(ctx context.Context, request *fwksch
 		verbose.Info("Completed running filter plugins", "remainingEndpoints", len(filteredEndpoints))
 	}
 
-	return filteredEndpoints
+	return filteredEndpoints, eliminations
+}
+
+// removedEndpoints returns the endpoints of received that are absent from kept.
+func removedEndpoints(received, kept []fwksched.Endpoint) []fwksched.Endpoint {
+	keptSet := make(map[fwksched.Endpoint]struct{}, len(kept))
+	for _, endpoint := range kept {
+		keptSet[endpoint] = struct{}{}
+	}
+	removed := make([]fwksched.Endpoint, 0, len(received)-len(kept))
+	for _, endpoint := range received {
+		if _, ok := keptSet[endpoint]; !ok {
+			removed = append(removed, endpoint)
+		}
+	}
+	return removed
 }
 
 func (p *SchedulerProfile) runScorerPlugins(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) map[fwksched.Endpoint]float64 {

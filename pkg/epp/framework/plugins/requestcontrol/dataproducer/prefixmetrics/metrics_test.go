@@ -270,7 +270,7 @@ func TestRecordGPUMiss(t *testing.T) {
 		GPUMissPeerLowerTier: 150,
 		GPUMissUncached:      50,
 	} {
-		got := testutil.ToFloat64(gpuMissTokens.WithLabelValues("test-plugin", "test-type", RolePrefill, reason))
+		got := testutil.ToFloat64(gpuMissTokens.WithLabelValues("test-plugin", "test-type", RolePrefill, reason, ""))
 		assert.Equal(t, want, got, reason)
 		total += got
 	}
@@ -289,9 +289,28 @@ func TestRecordGPUMiss_PlacementBeforeLowerTier(t *testing.T) {
 		SelectedConfirmed: 300, BestAvailableConfirmed: 400, PromptTokens: 500,
 	})
 
-	assert.Equal(t, 300.0, testutil.ToFloat64(gpuMissTokens.WithLabelValues("test-plugin", "test-type", RolePrefill, GPUMissFiltered)))
-	assert.Equal(t, 100.0, testutil.ToFloat64(gpuMissTokens.WithLabelValues("test-plugin", "test-type", RolePrefill, GPUMissUncached)))
+	assert.Equal(t, 300.0, testutil.ToFloat64(gpuMissTokens.WithLabelValues("test-plugin", "test-type", RolePrefill, GPUMissFiltered, "")))
+	assert.Equal(t, 100.0, testutil.ToFloat64(gpuMissTokens.WithLabelValues("test-plugin", "test-type", RolePrefill, GPUMissUncached, "")))
 	assert.Equal(t, 2, testutil.CollectAndCount(gpuMissTokens), "reasons with no tokens create no series")
+}
+
+// Filtered tokens carry the name of the filter that removed their endpoint, and
+// the part no filter accounts for keeps an empty filter label.
+func TestRecordGPUMiss_NamesTheFilter(t *testing.T) {
+	resetPredictionMetrics()
+	t.Cleanup(resetPredictionMetrics)
+
+	RecordGPUMiss("test-plugin", "test-type", RolePrefill, GPUMiss{
+		Selected: 100, BestPredicted: 100, BestAvailable: 400,
+		SelectedConfirmed: 100, BestAvailableConfirmed: 400, PromptTokens: 400,
+		FilteredBy: []FilterTokens{{Filter: "queue-guard", Tokens: 200}, {Filter: "affinity", Tokens: 60}},
+	})
+
+	for filter, want := range map[string]float64{"queue-guard": 200, "affinity": 60, "": 40} {
+		got := testutil.ToFloat64(gpuMissTokens.WithLabelValues("test-plugin", "test-type", RolePrefill, GPUMissFiltered, filter))
+		assert.Equal(t, want, got, "filter %q", filter)
+	}
+	assert.Equal(t, 3, testutil.CollectAndCount(gpuMissTokens))
 }
 
 func TestRecordGPUMiss_FullHitRecordsNothing(t *testing.T) {

@@ -582,6 +582,71 @@ func TestProduceThenPreRequest_AttributesGPUMiss(t *testing.T) {
 	}
 }
 
+// A filter is charged the drop in the best GPU-held prefix across it. The first
+// filter removes the 6-block endpoint and leaves a 5-block one, the second
+// removes an endpoint below the best that is left, and the third removes the
+// 5-block endpoint and leaves the chosen endpoint's 2 blocks.
+func TestProduceThenPreRequest_GPUMissNamesTheFilter(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	prefixmetrics.Register()
+
+	const name = "precise-gpu-miss-filter"
+	const promptBlocks = 8
+
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			keys := make([]kvblock.BlockHash, promptBlocks)
+			for i := range keys {
+				keys[i] = kvblock.BlockHash(i + 1)
+			}
+			return keys, nil
+		},
+		matchBlockKeys: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			gpuMatch := func(gpu int) kvcache.PodMatch {
+				return kvcache.PodMatch{
+					WeightedScore: float64(gpu), MatchedBlocks: gpu, ConfirmedBlocks: gpu,
+					BlocksByTier: map[string]int{kvcache.GPUTier: gpu},
+				}
+			}
+			return map[string]kvcache.PodMatch{
+				"10.0.0.1:8080": gpuMatch(2),
+				"10.0.0.2:8080": gpuMatch(6),
+				"10.0.0.3:8080": gpuMatch(4),
+				"10.0.0.4:8080": gpuMatch(5),
+			}, nil
+		},
+	}
+	p := newProducerForProduceAndPreRequest(ctx, name, idx)
+
+	endpoints := append(freshEndpoints(),
+		scheduling.NewEndpoint(&datalayer.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-c"}, Address: "10.0.0.3", Port: "8080"}, nil, nil),
+		scheduling.NewEndpoint(&datalayer.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod-d"}, Address: "10.0.0.4", Port: "8080"}, nil, nil),
+	)
+	req := tokenizedRequest("req-gpu-miss-filter", promptBlocks*testBlockSize)
+	req.TargetModel = "test-model"
+	require.NoError(t, p.Produce(ctx, req, endpoints))
+
+	result := primaryWithScored("default", endpoints[0], endpoints[0])
+	result.ProfileResults["default"].FilterEliminations = []scheduling.FilterElimination{
+		{Filter: plugin.TypedName{Type: "test", Name: "queue-guard"}, Endpoints: []scheduling.Endpoint{endpoints[1]}},
+		{Filter: plugin.TypedName{Type: "test", Name: "role"}, Endpoints: []scheduling.Endpoint{endpoints[2]}},
+		{Filter: plugin.TypedName{Type: "test", Name: "affinity"}, Endpoints: []scheduling.Endpoint{endpoints[3]}},
+	}
+	_ = p.PreRequest(ctx, req, result)
+
+	filteredBy := func(filter string) float64 {
+		return sumGPUMissTokens(t, func(labels map[string]string) bool {
+			return labels["plugin_name"] == name && labels["reason"] == prefixmetrics.GPUMissFiltered &&
+				labels["filter"] == filter
+		})
+	}
+	assert.Equal(t, float64(1*testBlockSize), filteredBy("queue-guard"))
+	assert.Equal(t, float64(3*testBlockSize), filteredBy("affinity"))
+	assert.Zero(t, filteredBy("role"))
+	assert.Zero(t, filteredBy(""))
+	assert.Equal(t, float64(4*testBlockSize), gpuMissTokens(t, name, prefixmetrics.GPUMissFiltered))
+}
+
 // With no state from Produce the scored maxima are unknown, so the chosen
 // endpoint stands in for them and the miss reads as a lower-tier and uncached
 // split on that endpoint alone.
@@ -1124,11 +1189,19 @@ func TestSpeculativeTTLExpiry_EvictsAllPromptKeys(t *testing.T) {
 }
 
 // gpuMissTokens returns the plugin's llm_d_epp_prefix_gpu_miss_tokens_total for
-// reason, or 0 when the series does not exist.
+// reason summed over its filters, or 0 when no series exists.
 func gpuMissTokens(t *testing.T, pluginName, reason string) float64 {
+	t.Helper()
+	return sumGPUMissTokens(t, func(labels map[string]string) bool {
+		return labels["plugin_name"] == pluginName && labels["reason"] == reason
+	})
+}
+
+func sumGPUMissTokens(t *testing.T, match func(labels map[string]string) bool) float64 {
 	t.Helper()
 	families, err := ctrlmetrics.Registry.Gather()
 	require.NoError(t, err)
+	total := 0.0
 	for _, family := range families {
 		if family.GetName() != "llm_d_epp_prefix_gpu_miss_tokens_total" {
 			continue
@@ -1138,10 +1211,10 @@ func gpuMissTokens(t *testing.T, pluginName, reason string) float64 {
 			for _, label := range metric.GetLabel() {
 				labels[label.GetName()] = label.GetValue()
 			}
-			if labels["plugin_name"] == pluginName && labels["reason"] == reason {
-				return metric.GetCounter().GetValue()
+			if match(labels) {
+				total += metric.GetCounter().GetValue()
 			}
 		}
 	}
-	return 0
+	return total
 }
