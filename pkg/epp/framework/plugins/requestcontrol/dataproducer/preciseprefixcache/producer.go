@@ -476,11 +476,18 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		return err
 	}
 
-	state := &bestAvailableState{predictedCachedTokens: make(map[datalayer.ID]int, len(results))}
+	state := &bestAvailableState{
+		predictedCachedTokens: make(map[datalayer.ID]int, len(results)),
+		gpuCachedTokens:       make(map[datalayer.ID]int, len(results)),
+	}
 	for _, result := range results {
 		predicted := predictedCachedTokens(result.info)
 		state.predictedCachedTokens[result.endpoint.GetMetadata().ID] = predicted
 		state.cachedTokens = max(state.cachedTokens, predicted)
+		gpu := gpuCachedTokens(result.info)
+		state.gpuCachedTokens[result.endpoint.GetMetadata().ID] = gpu
+		state.maxGPUCachedTokens = max(state.maxGPUCachedTokens, gpu)
+		state.maxConfirmedTokens = max(state.maxConfirmedTokens, confirmedCachedTokens(result.info))
 	}
 	p.pluginState.Write(request.RequestID, bestAvailableStateKey, state)
 

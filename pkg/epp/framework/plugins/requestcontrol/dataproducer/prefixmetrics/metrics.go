@@ -87,6 +87,36 @@ var promptTokens = prometheus.NewHistogramVec(
 	[]string{"plugin_name", "plugin_type", "endpoint_role", "modality"},
 )
 
+// Values of the reason label on llm_d_epp_prefix_gpu_miss_tokens_total: where
+// the index holds the prompt tokens the chosen endpoint lacks in GPU memory.
+const (
+	// GPUMissFiltered tokens were in the GPU memory of an endpoint a filter removed.
+	GPUMissFiltered = "filtered"
+	// GPUMissNotPicked tokens were in the GPU memory of an endpoint that reached
+	// the picker and was not chosen.
+	GPUMissNotPicked = "not_picked"
+	// GPUMissLowerTier tokens were in no endpoint's GPU memory and in a lower
+	// device tier of the chosen endpoint.
+	GPUMissLowerTier = "lower_tier"
+	// GPUMissPeerLowerTier tokens were in no endpoint's GPU memory and only in a
+	// lower device tier of another endpoint.
+	GPUMissPeerLowerTier = "peer_lower_tier"
+	// GPUMissUncached tokens were confirmed on no endpoint.
+	GPUMissUncached = "uncached"
+)
+
+var gpuMissTokens = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+		Name:      "prefix_gpu_miss_tokens_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"Prompt tokens the scheduler's chosen endpoint does not hold in GPU memory, by where the index holds them. "+
+				"filter names the filter that removed the endpoint holding filtered tokens.",
+			compbasemetrics.ALPHA),
+	},
+	[]string{"plugin_name", "plugin_type", "endpoint_role", "reason", "filter"},
+)
+
 var mmPredictedCachedTokens = prometheus.NewHistogramVec(
 	prometheus.HistogramOpts{
 		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
@@ -118,7 +148,7 @@ var registerOnce sync.Once
 func Register() {
 	registerOnce.Do(func() {
 		metrics.Registry.MustRegister(predictedCachedTokens, bestPredictedCachedTokens,
-			bestAvailableCachedTokens, promptTokens, mmPredictedCachedTokens, mmPromptTokens)
+			bestAvailableCachedTokens, promptTokens, gpuMissTokens, mmPredictedCachedTokens, mmPromptTokens)
 	})
 }
 
@@ -155,6 +185,59 @@ func RecordPrediction(pluginName, pluginType, role, modality string, p Predictio
 	bestPredictedCachedTokens.WithLabelValues(pluginName, pluginType, role, modality).Observe(float64(p.BestPredicted))
 	bestAvailableCachedTokens.WithLabelValues(pluginName, pluginType, role, modality).Observe(float64(p.BestAvailable))
 	promptTokens.WithLabelValues(pluginName, pluginType, role, modality).Observe(float64(p.PromptTokens))
+}
+
+// GPUMiss is one request's prefix position in prompt tokens over the endpoint
+// sets of Prediction. Selected, BestPredicted and BestAvailable count the
+// contiguous prefix held in GPU memory, and the two Confirmed fields count the
+// contiguous prefix the engine confirmed in any device tier. FilteredBy names
+// the filters behind the tokens between BestPredicted and BestAvailable.
+type GPUMiss struct {
+	Selected               int
+	BestPredicted          int
+	BestAvailable          int
+	SelectedConfirmed      int
+	BestAvailableConfirmed int
+	PromptTokens           int
+	FilteredBy             []FilterTokens
+}
+
+// FilterTokens is the GPU-held prefix tokens lost when Filter removed an
+// endpoint.
+type FilterTokens struct {
+	Filter string
+	Tokens int
+}
+
+// RecordGPUMiss splits the prompt tokens beyond m.Selected across the reasons,
+// so the reasons of one request sum to the prompt minus its GPU hit. Tokens in
+// another endpoint's GPU memory count as placement even when the chosen
+// endpoint holds them in a lower tier. Filtered tokens carry the filter of
+// m.FilteredBy that accounts for them, and the rest an empty filter label.
+func RecordGPUMiss(pluginName, pluginType, role string, m GPUMiss) {
+	onChosen := max(m.BestAvailable, m.SelectedConfirmed)
+	onAnyEndpoint := max(onChosen, m.BestAvailableConfirmed)
+	unnamed := m.BestAvailable - m.BestPredicted
+	for _, part := range m.FilteredBy {
+		if part.Tokens > 0 {
+			gpuMissTokens.WithLabelValues(pluginName, pluginType, role, GPUMissFiltered, part.Filter).Add(float64(part.Tokens))
+			unnamed -= part.Tokens
+		}
+	}
+	for _, part := range []struct {
+		reason string
+		tokens int
+	}{
+		{GPUMissFiltered, unnamed},
+		{GPUMissNotPicked, m.BestPredicted - m.Selected},
+		{GPUMissLowerTier, onChosen - m.BestAvailable},
+		{GPUMissPeerLowerTier, onAnyEndpoint - onChosen},
+		{GPUMissUncached, m.PromptTokens - onAnyEndpoint},
+	} {
+		if part.tokens > 0 {
+			gpuMissTokens.WithLabelValues(pluginName, pluginType, role, part.reason, "").Add(float64(part.tokens))
+		}
+	}
 }
 
 // RecordMMPrediction records a request's multimodal prompt tokens alongside

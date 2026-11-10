@@ -48,6 +48,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/eviction"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -284,7 +285,27 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		}
 	}
 
+	// Producers may hold per-request state between Produce and PreRequest, where
+	// they normally release it. Release it here for every path that leaves
+	// HandleRequest without reaching PreRequest: screeners eliminating every
+	// candidate after RequestHandling producers ran, an Admitter denial, a scheduler
+	// error, or a prepareRequest failure.
+	reachedPreRequest := false
+	defer func() {
+		if !reachedPreRequest {
+			d.releaseProducerState(ctx, reqCtx.SchedulingRequest)
+		}
+	}()
+
 	snapshotOfCandidatePods := d.toSchedulerEndpoints(endpointCandidates)
+	// A producer whose RequestHandling run fails leaves its keys missing for the
+	// Scheduling phase too, so producers requiring them are skipped there.
+	missingKeys := map[string]struct{}{}
+	if err := d.runDataProducers(ctx, fwkrc.RequestHandlingDataProducerExtensionPoint, d.requestControlPlugins.requestHandlingDataProducers,
+		reqCtx.SchedulingRequest, snapshotOfCandidatePods, missingKeys); err != nil {
+		// Don't fail the request if DataProducer plugins fail.
+		logger.Error(err, "failed to prepare request handling data")
+	}
 	snapshotOfCandidatePods = d.runScreeners(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
 	if len(snapshotOfCandidatePods) == 0 {
 		return reqCtx, errcommon.Error{
@@ -294,8 +315,8 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		}
 	}
 	// Prepare per request data by running DataProducer plugins.
-	err = d.runDataProducerPlugins(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
-	if err != nil {
+	if err := d.runDataProducers(ctx, fwkrc.DataProducerExtensionPoint, d.requestControlPlugins.dataProducerPlugins,
+		reqCtx.SchedulingRequest, snapshotOfCandidatePods, missingKeys); err != nil {
 		// Don't fail the request if DataProducer plugins fail.
 		logger.Error(err, "failed to prepare per request data")
 	}
@@ -340,6 +361,7 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		reservationReleaser.ReleaseDispatchReservation(reqCtx.SchedulingRequest.RequestID)
 		reservationPending = false
 	}
+	reachedPreRequest = true
 	if err := d.priorityRewriteIfNeeded(ctx, reqCtx, inferenceRequestBody); err != nil {
 		return reqCtx, err
 	}
@@ -745,20 +767,60 @@ func (d *Director) runRequestHeaderProcessors(ctx context.Context, request *fwks
 	return nil
 }
 
-func (d *Director) runDataProducerPlugins(ctx context.Context,
-	request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
-	plugins := d.requestControlPlugins.dataProducerPlugins
+// runDataProducers runs one phase's producers. missing holds the keys of
+// producers that failed or were skipped, across phases.
+func (d *Director) runDataProducers(ctx context.Context, extensionPoint string, plugins []fwkrc.DataProducer,
+	request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint, missing map[string]struct{}) error {
 	if len(plugins) == 0 {
 		return nil
 	}
 	// Each producer runs under its own timeout so a slow one does not extend the
-	// budget of the others.
-	for _, p := range plugins {
-		if err := dataProducerPluginsWithTimeout(ctx, producerTimeout(p), []fwkrc.DataProducer{p}, request, endpoints); err != nil {
-			return err
+	// budget of the others. A failed producer does not stop the ones after it;
+	// only producers that require a key it would have produced are skipped, and
+	// their own keys count as missing in turn. The errors are returned joined.
+	// Once the request's context is done, no further producer is started.
+	var errs []error
+	markMissing := func(p fwkrc.DataProducer) {
+		for key := range p.Produces() {
+			missing[key.String()] = struct{}{}
 		}
 	}
-	return nil
+	for _, p := range plugins {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		if key, ok := missingRequiredInput(p, missing); ok {
+			errs = append(errs, fmt.Errorf("DataProducer %q skipped: required input %s was not produced", p.TypedName().String(), key))
+			markMissing(p)
+			continue
+		}
+		if err := dataProducerPluginsWithTimeout(ctx, extensionPoint, producerTimeout(p), []fwkrc.DataProducer{p}, request, endpoints); err != nil {
+			errs = append(errs, err)
+			if ctx.Err() != nil {
+				break
+			}
+			markMissing(p)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// missingRequiredInput returns a key that p requires and that is in missing.
+func missingRequiredInput(p fwkrc.DataProducer, missing map[string]struct{}) (string, bool) {
+	if len(missing) == 0 {
+		return "", false
+	}
+	consumer, ok := p.(fwkplugin.ConsumerPlugin)
+	if !ok {
+		return "", false
+	}
+	for key := range consumer.Consumes().Required {
+		if _, ok := missing[key.String()]; ok {
+			return key.String(), true
+		}
+	}
+	return "", false
 }
 
 func (d *Director) runScreeners(ctx context.Context,
@@ -832,6 +894,16 @@ func (d *Director) runResponseHeaderPlugins(ctx context.Context, request *fwksch
 		metrics.RecordPluginProcessingLatency(fwkrc.ResponseReceivedExtensionPoint, name.Type, name.Name, time.Since(before))
 		if debugEnabled {
 			loggerDebug.Info("Completed running ResponseReceived plugin successfully", "plugin", name)
+		}
+	}
+}
+
+func (d *Director) releaseProducerState(ctx context.Context, request *fwksched.InferenceRequest) {
+	for _, plugins := range [][]fwkrc.DataProducer{d.requestControlPlugins.requestHandlingDataProducers, d.requestControlPlugins.dataProducerPlugins} {
+		for _, p := range plugins {
+			if abandoner, ok := p.(fwkrc.RequestAbandoned); ok {
+				abandoner.RequestAbandoned(ctx, request)
+			}
 		}
 	}
 }

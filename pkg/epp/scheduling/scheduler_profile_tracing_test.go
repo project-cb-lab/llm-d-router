@@ -220,7 +220,7 @@ func TestRunFilterPluginsSingleSpan(t *testing.T) {
 	endpoints := newTestEndpoints("pod1", "pod2", "pod3")
 
 	ctx, root := otel.Tracer("test").Start(context.Background(), "root")
-	result := profile.runFilterPlugins(ctx, &fwksched.InferenceRequest{TargetModel: "m1", Headers: map[string]string{reqcommon.RequestIDHeaderKey: "r1"}}, endpoints)
+	result, _ := profile.runFilterPlugins(ctx, &fwksched.InferenceRequest{TargetModel: "m1", Headers: map[string]string{reqcommon.RequestIDHeaderKey: "r1"}}, endpoints)
 	root.End()
 
 	if len(result) != 2 {
@@ -271,7 +271,7 @@ func TestRunFilterPluginsChainEmitsOneSpan(t *testing.T) {
 	endpoints := newTestEndpoints("pod1", "pod2", "pod3")
 
 	ctx, root := otel.Tracer("test").Start(context.Background(), "root")
-	result := profile.runFilterPlugins(ctx, &fwksched.InferenceRequest{}, endpoints)
+	result, _ := profile.runFilterPlugins(ctx, &fwksched.InferenceRequest{}, endpoints)
 	root.End()
 
 	if len(result) != 1 {
@@ -305,7 +305,7 @@ func TestRunFilterPluginsDrainBreakStillEndsSpan(t *testing.T) {
 	endpoints := newTestEndpoints("pod1", "pod2")
 
 	ctx, root := otel.Tracer("test").Start(context.Background(), "root")
-	result := profile.runFilterPlugins(ctx, &fwksched.InferenceRequest{}, endpoints)
+	result, _ := profile.runFilterPlugins(ctx, &fwksched.InferenceRequest{}, endpoints)
 	root.End()
 
 	if len(result) != 0 {

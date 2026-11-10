@@ -155,9 +155,10 @@ func TestSchedulePlugins(t *testing.T) {
 			}
 
 			// ScoredCandidates covers the whole candidate set in unspecified order and
-			// is asserted in TestSchedulerProfileScoredCandidates.
+			// is asserted in TestSchedulerProfileScoredCandidates. FilterEliminations
+			// is asserted in TestSchedulerProfileFilterEliminations.
 			if diff := cmp.Diff(wantRes, got, cmp.Comparer(fwksched.EndpointComparer),
-				cmpopts.IgnoreFields(fwksched.ProfileRunResult{}, "ScoredCandidates")); diff != "" {
+				cmpopts.IgnoreFields(fwksched.ProfileRunResult{}, "ScoredCandidates", "FilterEliminations")); diff != "" {
 				t.Errorf("Unexpected output (-want +got): %v", diff)
 			}
 			// Validate plugin execution counts dynamically
@@ -234,6 +235,58 @@ func TestSchedulerProfileScoredCandidates(t *testing.T) {
 	}
 	if diff := cmp.Diff(wantScores, gotScores); diff != "" {
 		t.Errorf("Unexpected scored candidates (-want +got): %v", diff)
+	}
+}
+
+// A filter that removed endpoints is reported with them in filter order, and a
+// filter that removed none has no entry.
+func TestSchedulerProfileFilterEliminations(t *testing.T) {
+	pod := func(name string) k8stypes.NamespacedName { return k8stypes.NamespacedName{Name: name} }
+	keepTwo := &testPlugin{
+		typedName: fwkplugin.TypedName{Type: "test", Name: "keep-two"},
+		FilterRes: []k8stypes.NamespacedName{pod("pod1"), pod("pod2")},
+	}
+	keepSame := &testPlugin{
+		typedName: fwkplugin.TypedName{Type: "test", Name: "keep-same"},
+		FilterRes: []k8stypes.NamespacedName{pod("pod1"), pod("pod2")},
+	}
+	keepOne := &testPlugin{
+		typedName: fwkplugin.TypedName{Type: "test", Name: "keep-one"},
+		FilterRes: []k8stypes.NamespacedName{pod("pod1")},
+		PickRes:   pod("pod1"),
+	}
+	profile := NewSchedulerProfile().WithFilters(keepTwo, keepSame, keepOne).WithPicker(keepOne)
+
+	input := []fwksched.Endpoint{
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: pod("pod1")}, nil, nil),
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: pod("pod2")}, nil, nil),
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: pod("pod3")}, nil, nil),
+	}
+	request := &fwksched.InferenceRequest{TargetModel: "test-model", RequestID: uuid.NewString()}
+
+	got, err := profile.Run(context.Background(), request, input)
+	if err != nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+
+	type elimination struct {
+		Filter    string
+		Endpoints []string
+	}
+	gotEliminations := make([]elimination, 0, len(got.FilterEliminations))
+	for _, e := range got.FilterEliminations {
+		names := make([]string, 0, len(e.Endpoints))
+		for _, endpoint := range e.Endpoints {
+			names = append(names, endpoint.GetMetadata().ID.String())
+		}
+		gotEliminations = append(gotEliminations, elimination{Filter: e.Filter.Name, Endpoints: names})
+	}
+	want := []elimination{
+		{Filter: "keep-two", Endpoints: []string{"/pod3"}},
+		{Filter: "keep-one", Endpoints: []string{"/pod2"}},
+	}
+	if diff := cmp.Diff(want, gotEliminations); diff != "" {
+		t.Errorf("Unexpected filter eliminations (-want +got): %v", diff)
 	}
 }
 

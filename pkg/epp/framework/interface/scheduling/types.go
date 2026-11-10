@@ -172,6 +172,16 @@ type ProfileRunResult struct {
 	// a subset of these, so the two are not parallel. Ordering is unspecified;
 	// consumers key by endpoint.
 	ScoredCandidates []ScoredEndpoint
+	// FilterEliminations lists the endpoints each filter removed, in filter
+	// order. A filter that removed none has no entry.
+	FilterEliminations []FilterElimination
+}
+
+// FilterElimination is the endpoints one filter removed from a profile's
+// candidates.
+type FilterElimination struct {
+	Filter    fwkplugin.TypedName
+	Endpoints []Endpoint
 }
 
 // SchedulingResult captures the result of the scheduling cycle.
