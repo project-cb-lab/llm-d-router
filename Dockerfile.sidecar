@@ -1,15 +1,10 @@
-# BASE_IMAGE can be overridden at build time, e.g.:
-#   --build-arg BASE_IMAGE=registry.access.redhat.com/ubi9/ubi-micro:9.7
-# Default is distroless/static which includes CA certs and has minimal CVE surface.
-# NOTE: if using scratch, CA certificates must be copied from the builder stage:
-#   COPY --from=builder /etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-bundle.crt
-ARG BASE_IMAGE=gcr.io/distroless/static:nonroot
-
-# Build Stage: using Go image
-FROM --platform=${BUILDPLATFORM} golang:1.27.4 AS builder
+FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10@sha256:0e3894cea4fc077084245e8aa2befc8a7d91a4f60fbf850f0b5b555cbe62ee26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG COMMIT_SHA=unknown
+ARG BUILD_REF
 
+USER root
 WORKDIR /workspace
 # Copy the Go Modules manifests
 COPY go.mod go.mod
@@ -29,21 +24,15 @@ COPY version version
 # was called. For example, if we call make image-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-
-# Precompile without version flags so commit-only changes can reuse the
-# expensive compile work from the Docker layer cache.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /dev/null cmd/cmd.go
-
-ARG COMMIT_SHA=unknown
-ARG BUILD_REF
-ARG LDFLAGS="-s -w"
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o bin/pd-sidecar \
-       -ldflags="${LDFLAGS} -X github.com/llm-d/llm-d-router/pkg/sidecar/version.CommitSHA=${COMMIT_SHA} -X github.com/llm-d/llm-d-router/pkg/sidecar/version.BuildRef=${BUILD_REF}" \
+ENV CGO_ENABLED=1
+ENV GOOS=${TARGETOS:-linux}
+ENV GOARCH=${TARGETARCH}
+RUN go build -a -tags strictfipsruntime -o bin/pd-sidecar \
+       -ldflags="-X github.com/llm-d/llm-d-router/pkg/sidecar/version.CommitSHA=${COMMIT_SHA} -X github.com/llm-d/llm-d-router/pkg/sidecar/version.BuildRef=${BUILD_REF}" \
        cmd/cmd.go
 
-# Runtime stage
-FROM ${BASE_IMAGE}
-
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7@sha256:d91be7cea9f03a757d69ad7fcdfcd7849dba820110e7980d5e2a1f46ed06ea3b
+WORKDIR /
 COPY --from=builder /workspace/bin/pd-sidecar /app/pd-sidecar
 USER 65532:65532
 
