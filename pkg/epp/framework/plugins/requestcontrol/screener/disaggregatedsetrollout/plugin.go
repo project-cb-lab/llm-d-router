@@ -254,7 +254,7 @@ func (c *Screener) rebuildDistributionLocked() {
 		if !pod.ready {
 			continue
 		}
-		incrementRoleCount(roleCounts, pod)
+		incrementRoleCount(roleCounts, pod, c.config.RevisionGating.CombinedRoles)
 	}
 	previous := c.distribution
 	next := newRevisionDistribution(roleCounts, requiredRoles, mode)
@@ -263,11 +263,17 @@ func (c *Screener) rebuildDistributionLocked() {
 	recordRevisionGatingShares(c.typedName.Name, mode, previous, c.distribution)
 }
 
-func incrementRoleCount(counts map[string]map[string]int, pod podInfo) {
+func incrementRoleCount(counts map[string]map[string]int, pod podInfo, combined map[string][]string) {
 	if counts[pod.revision] == nil {
 		counts[pod.revision] = make(map[string]int)
 	}
-	counts[pod.revision][pod.role]++
+	roles, ok := combined[pod.role]
+	if !ok {
+		roles = []string{pod.role}
+	}
+	for _, role := range roles {
+		counts[pod.revision][role]++
+	}
 }
 
 func newRevisionDistribution(roleCounts map[string]map[string]int, requiredRoles []string, mode GatingMode) revisionDistribution {

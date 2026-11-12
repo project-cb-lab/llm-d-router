@@ -63,14 +63,17 @@ type Scope struct {
 // A request carrying RevisionHeaderName always selects that revision strictly.
 // The selected endpoint's revision is stamped into the same response header.
 type RevisionGating struct {
-	RevisionHeaderName  string            `json:"revisionHeaderName,omitempty"`
-	RevisionLabelKey    string            `json:"revisionLabelKey,omitempty"`
-	RoleLabelKey        string            `json:"roleLabelKey,omitempty"`
-	DisableCoordination bool              `json:"disableCoordination,omitempty"`
-	Mode                GatingMode        `json:"mode"`
-	RequiredRoles       []string          `json:"requiredRoles,omitempty"`
-	Affinity            *RevisionAffinity `json:"affinity,omitempty"`
-	Overflow            *RevisionOverflow `json:"overflow,omitempty"`
+	RevisionHeaderName  string     `json:"revisionHeaderName,omitempty"`
+	RevisionLabelKey    string     `json:"revisionLabelKey,omitempty"`
+	RoleLabelKey        string     `json:"roleLabelKey,omitempty"`
+	DisableCoordination bool       `json:"disableCoordination,omitempty"`
+	Mode                GatingMode `json:"mode"`
+	RequiredRoles       []string   `json:"requiredRoles,omitempty"`
+	// CombinedRoles maps a Pod role value to the roles it serves on its own, for example
+	// an aggregated Pod that counts as both prefill and decode for coverage and weights.
+	CombinedRoles map[string][]string `json:"combinedRoles,omitempty"`
+	Affinity      *RevisionAffinity   `json:"affinity,omitempty"`
+	Overflow      *RevisionOverflow   `json:"overflow,omitempty"`
 }
 
 // RevisionAffinity controls how the weighted revision choice is drawn.

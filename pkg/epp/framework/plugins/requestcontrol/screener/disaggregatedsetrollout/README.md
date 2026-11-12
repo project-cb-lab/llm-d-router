@@ -325,6 +325,7 @@ request. Do not add it to a scheduling profile.
 | `revisionGating.mode` | string | Yes | | `sum`, `max-role`, or `disabled`. |
 | `revisionGating.requiredRoles` | array | Yes for `sum` and `max-role` | | Roles that must each have a Ready Pod for a revision to receive traffic. List order breaks a `max-role` tie. |
 | `revisionGating.revisionHeaderName` | string | No | `x-llm-d-disagg-revision` | Request and response header carrying the rollout revision. A supplied value is a strict constraint. |
+| `revisionGating.combinedRoles` | object | No | | Maps a Pod role value to the required roles that Pod serves on its own, so one aggregated Pod counts toward each of them for coverage and weights. |
 | `revisionGating.revisionLabelKey` | string | No | `disaggregatedset.x-k8s.io/revision` | Label identifying a rollout revision. |
 | `revisionGating.roleLabelKey` | string | No | `disaggregatedset.x-k8s.io/role` | Label identifying a Pod role. |
 | `revisionGating.disableCoordination` | boolean | No | `false` | Disables coordination of rollout revisions across parallel requests. Set only for known sequential P/D deployments; E/P/D requires coordination. |

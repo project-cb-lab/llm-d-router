@@ -19,6 +19,9 @@ package disagg
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -32,16 +35,38 @@ const (
 // compile-time type assertion
 var _ deciderPlugin = &AlwaysDisaggPDDecider{}
 
-// AlwaysDisaggPDDecider is a PD decider plugin which always decide to disaggregate PD
+// AlwaysDisaggPDDecider is a PD decider plugin which always decide to disaggregate PD,
+// except when the picked decode endpoint matches SelfPrefillSelector: such an endpoint
+// runs its own prefill (an aggregated engine), so the request is served decode-only.
 type AlwaysDisaggPDDecider struct {
-	typedName plugin.TypedName
+	typedName   plugin.TypedName
+	selfPrefill labels.Selector
+}
+
+type alwaysDisaggPDDeciderParameters struct {
+	// SelfPrefillSelector is a Kubernetes label selector over the decode endpoint's labels.
+	SelfPrefillSelector string `json:"selfPrefillSelector,omitempty"`
 }
 
 // AlwaysDisaggPDDeciderPluginFactory defines the factory function for creating
 // a new instance of the AlwaysDisaggPDDecider.
-func AlwaysDisaggPDDeciderPluginFactory(name string, _ *json.Decoder,
+func AlwaysDisaggPDDeciderPluginFactory(name string, rawParameters *json.Decoder,
 	_ plugin.Handle) (plugin.Plugin, error) {
-	return newAlwaysDisaggPDDecider().WithName(name), nil
+	parameters := alwaysDisaggPDDeciderParameters{}
+	if rawParameters != nil {
+		if err := rawParameters.Decode(&parameters); err != nil {
+			return nil, fmt.Errorf("failed to parse %s plugin config: %w", AlwaysDisaggPDDeciderPluginType, err)
+		}
+	}
+	d := newAlwaysDisaggPDDecider().WithName(name)
+	if parameters.SelfPrefillSelector != "" {
+		selector, err := labels.Parse(parameters.SelfPrefillSelector)
+		if err != nil {
+			return nil, fmt.Errorf("%s: invalid selfPrefillSelector: %w", AlwaysDisaggPDDeciderPluginType, err)
+		}
+		d.selfPrefill = selector
+	}
+	return d, nil
 }
 
 func newAlwaysDisaggPDDecider() *AlwaysDisaggPDDecider {
@@ -62,5 +87,8 @@ func (d *AlwaysDisaggPDDecider) WithName(name string) *AlwaysDisaggPDDecider {
 }
 
 func (d *AlwaysDisaggPDDecider) disaggregate(ctx context.Context, request *scheduling.InferenceRequest, endpoint scheduling.Endpoint) bool {
-	return true
+	if d.selfPrefill == nil || endpoint == nil || endpoint.GetMetadata() == nil {
+		return true
+	}
+	return !d.selfPrefill.Matches(labels.Set(endpoint.GetMetadata().Labels))
 }
