@@ -18,6 +18,8 @@ package datalayer
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 )
@@ -49,6 +51,43 @@ type CrossReplicaSyncer interface {
 	// The bool reports whether the returned value already existed. Implementations
 	// must provide linearizable behavior across every EPP replica sharing the syncer.
 	GetOrSet(ctx context.Context, key StateKey, id string, candidate any) (actual any, existed bool, err error)
+}
+
+// ErrCoordinationUnsupported is returned by GetOrSet from a CrossReplicaSyncer
+// that cannot provide linearizable request-level state across replicas.
+var ErrCoordinationUnsupported = errors.New("the cross-replica syncer does not support GetOrSet")
+
+// CoordinationChecker is an optional interface for a CrossReplicaSyncer whose
+// GetOrSet fails on every call. CheckCoordination returns that error, which
+// wraps ErrCoordinationUnsupported, or nil when GetOrSet is supported.
+type CoordinationChecker interface {
+	CheckCoordination() error
+}
+
+// CoordinationConsumer is an optional interface for a plugin that calls
+// GetOrSet on the configured CrossReplicaSyncer. Configuration fails when
+// RequiresCoordination returns true and the syncer's CheckCoordination returns
+// an error.
+type CoordinationConsumer interface {
+	RequiresCoordination() bool
+}
+
+// CrossReplicaBatchSyncer is an optional interface for a CrossReplicaSyncer
+// that publishes many endpoints in one call. When the syncer implements it,
+// the publisher calls SetBatch once per contributor per cycle in place of Set.
+// The publisher does not hold its endpoint lock during the call; endpoints
+// removed while it runs are deleted afterwards.
+type CrossReplicaBatchSyncer interface {
+	// SetBatch publishes the live local value for each endpoint in endpointIDs
+	// and refreshes the peer aggregates used by Get. timeout is positive and
+	// bounds each unit of work the implementation sends, such as one
+	// transaction. It returns an error for each endpoint that was not
+	// published, including endpoints left unattempted when ctx ends, and must
+	// return promptly when ctx ends. A nil
+	// or empty map means every endpoint was published. Calls for different specs
+	// can run concurrently with the same endpointIDs, so implementations must
+	// not modify it.
+	SetBatch(ctx context.Context, spec CrossReplicaSpec, endpointIDs []string, timeout time.Duration) map[string]error
 }
 
 // CrossReplicaContributor is an opt-in interface for endpoint extractors that
