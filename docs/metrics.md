@@ -628,7 +628,7 @@ match data but is not instrumented here. Requests that reach no endpoint are not
 | `llm_d_epp_prefix_best_predicted_cached_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role`, `modality` | Highest such prediction among the endpoints the scheduler selected from. |
 | `llm_d_epp_prefix_best_available_cached_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role`, `modality` | Highest such prediction among the request's candidate endpoints before filtering. |
 | `llm_d_epp_prefix_prompt_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role`, `modality` | Prompt tokens the predictions were measured against. |
-| `llm_d_epp_prefix_gpu_miss_tokens_total` | Counter | `plugin_name`, `plugin_type`, `endpoint_role`, `reason` | Prompt tokens the chosen endpoint does not hold in GPU memory, by where the index holds them. Precise prefix-cache producer only. |
+| `llm_d_epp_prefix_gpu_miss_tokens_total` | Counter | `plugin_name`, `plugin_type`, `endpoint_role`, `reason`, `filter` | Prompt tokens the chosen endpoint does not hold in GPU memory, by where the index holds them. `filter` names the filter that removed the endpoint holding `filtered` tokens. Precise prefix-cache producer only. |
 | `llm_d_epp_prefix_mm_predicted_cached_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role` | Multimodal prompt tokens predicted to hit the chosen endpoint's prefix cache. |
 | `llm_d_epp_prefix_mm_prompt_tokens` | Histogram | `plugin_name`, `plugin_type`, `endpoint_role` | Multimodal prompt tokens the multimodal prediction was measured against. |
 
@@ -688,9 +688,14 @@ were in the GPU memory of an endpoint that reached the picker and was not chosen
 placement. `lower_tier` tokens were in no endpoint's GPU memory and in a lower tier of the chosen
 endpoint, which is eviction the engine restores from. `peer_lower_tier` tokens were only in a lower
 tier of another endpoint, and `uncached` tokens were confirmed nowhere, which covers the new part of
-a prompt and prefixes every tier has evicted. Read `filtered` only for a producer whose index covers
-one role, because a decode pod holding the prefix in a shared index counts as removed by the role
-filter.
+a prompt and prefixes every tier has evicted.
+
+The `filter` label names the filter behind `filtered` tokens and is empty for every other reason.
+Each filter of the profile is charged the drop in the longest GPU-held prefix between the endpoints
+it received and the endpoints it kept, so a filter that removes an endpoint holding less than the
+best endpoint it kept is charged nothing. `filtered` tokens with an empty `filter` were on an
+endpoint the profile never received. With an index shared across roles, a decode pod holding the
+prefix is charged to the role filter of the prefill profile.
 
 Comparing these ratios is what the prediction metrics are for, subject to the limits below.
 
@@ -1076,6 +1081,7 @@ These metrics are owned by the EPP Flow Control layer.
 | `llm_d_epp_flow_control_request_enqueue_duration_seconds` | Histogram | `fairness_id`, `priority`, `outcome` | Time spent admitting a request to the queue. |
 | `llm_d_epp_flow_control_queue_size` | Gauge | `fairness_id`, `priority`, `inference_pool`, `model_name`, `target_model_name` | Requests currently held in the queue. |
 | `llm_d_epp_flow_control_queue_bytes` | Gauge | `fairness_id`, `priority`, `inference_pool`, `model_name`, `target_model_name` | Bytes currently held in the queue. |
+| `llm_d_epp_flow_control_peer_queued_requests` | Gauge | `priority`, `inference_pool` | Requests queued per priority band on peer EPP replicas, including dispatched ones not yet on an endpoint, as last read. |
 | `llm_d_epp_flow_control_pool_saturation` | Gauge | `inference_pool`, `stage` | Saturation signal used to gate dispatch. |
 | `llm_d_epp_flow_control_stale_endpoints` | Gauge | `detector`, `stage` | Candidate endpoints with missing or stale metrics. |
 | `llm_d_epp_flow_control_detector_saturation` | Gauge | `detector`, `stage` | Saturation reported by each child of a `max-saturation-detector`, from its most recent evaluation. `stage` is `prefill`, `decode`, or empty when the pool has no endpoints. |
@@ -1131,6 +1137,16 @@ These metrics are owned by the EPP Flow Control layer.
 *   **Description:** Current total size in bytes of requests actively held in the Flow Control queue.
 *   **Usage:** Tracks memory pressure from queued requests. Compare against the configured `maxBytes`
     capacity to gauge how close a band is to rejecting new requests.
+
+#### `llm_d_epp_flow_control_peer_queued_requests`
+
+*   **Type:** Gauge
+*   **Labels:** `priority`, `inference_pool`
+*   **Description:** Requests queued per priority band on the other EPP replicas of the pool,
+    including requests dispatched and not yet on an endpoint, as last read from the cross-replica syncer. Reported only when `flowControl.crossReplica` is set
+    and the usage limit policy reads peer demand (`peer-demand-holdback-policy`).
+*   **Usage:** Shows which peer bands hold this replica's lower bands. Compare against
+    `llm_d_epp_flow_control_queue_size` on the peer.
 
 #### `llm_d_epp_flow_control_pool_saturation`
 
